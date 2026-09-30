@@ -1,158 +1,156 @@
 package gui
 
 import (
-	"os/exec"
-
-	"github.com/jesseduffield/gocui"
+	"github.com/jesseduffield/lazygit/pkg/gocui"
+	"github.com/jesseduffield/lazygit/pkg/gui/context"
+	"github.com/jesseduffield/lazygit/pkg/gui/types"
 )
 
-type viewUpdateOpts struct {
-	title string
+func (gui *Gui) runTaskForView(view *gocui.View, task types.UpdateTask) error {
+	switch v := task.(type) {
+	case *types.RenderStringTask:
+		return gui.newStringTask(view, v.Str)
 
-	// awkwardly calling this noWrap because of how hard Go makes it to have
-	// a boolean option that defaults to true
-	noWrap bool
+	case *types.RenderStringWithoutScrollTask:
+		return gui.newStringTaskWithoutScroll(view, v.Str)
 
-	highlight bool
+	case *types.RenderStringWithScrollTask:
+		return gui.newStringTaskWithScroll(view, v.Str, v.OriginX, v.OriginY)
 
-	task updateTask
-}
+	case *types.RunCommandTask:
+		return gui.newCmdTask(view, v.Cmd, v.Prefix)
 
-type refreshMainOpts struct {
-	main      *viewUpdateOpts
-	secondary *viewUpdateOpts
-}
-
-// constants for updateTask's kind field
-type TaskKind int
-
-const (
-	RENDER_STRING TaskKind = iota
-	RENDER_STRING_WITHOUT_SCROLL
-	RUN_COMMAND
-	RUN_PTY
-)
-
-type updateTask interface {
-	GetKind() TaskKind
-}
-
-type renderStringTask struct {
-	str string
-}
-
-func (t *renderStringTask) GetKind() TaskKind {
-	return RENDER_STRING
-}
-
-func NewRenderStringTask(str string) *renderStringTask {
-	return &renderStringTask{str: str}
-}
-
-type renderStringWithoutScrollTask struct {
-	str string
-}
-
-func (t *renderStringWithoutScrollTask) GetKind() TaskKind {
-	return RENDER_STRING_WITHOUT_SCROLL
-}
-
-func NewRenderStringWithoutScrollTask(str string) *renderStringWithoutScrollTask {
-	return &renderStringWithoutScrollTask{str: str}
-}
-
-type runCommandTask struct {
-	cmd    *exec.Cmd
-	prefix string
-}
-
-func (t *runCommandTask) GetKind() TaskKind {
-	return RUN_COMMAND
-}
-
-func NewRunCommandTask(cmd *exec.Cmd) *runCommandTask {
-	return &runCommandTask{cmd: cmd}
-}
-
-func NewRunCommandTaskWithPrefix(cmd *exec.Cmd, prefix string) *runCommandTask {
-	return &runCommandTask{cmd: cmd, prefix: prefix}
-}
-
-type runPtyTask struct {
-	cmd    *exec.Cmd
-	prefix string
-}
-
-func (t *runPtyTask) GetKind() TaskKind {
-	return RUN_PTY
-}
-
-func NewRunPtyTask(cmd *exec.Cmd) *runPtyTask {
-	return &runPtyTask{cmd: cmd}
-}
-
-// currently unused
-// func (gui *Gui) createRunPtyTaskWithPrefix(cmd *exec.Cmd, prefix string) *runPtyTask {
-// 	return &runPtyTask{cmd: cmd, prefix: prefix}
-// }
-
-func (gui *Gui) runTaskForView(view *gocui.View, task updateTask) error {
-	switch task.GetKind() {
-	case RENDER_STRING:
-		specificTask := task.(*renderStringTask)
-		return gui.newStringTask(view, specificTask.str)
-
-	case RENDER_STRING_WITHOUT_SCROLL:
-		specificTask := task.(*renderStringWithoutScrollTask)
-		return gui.newStringTaskWithoutScroll(view, specificTask.str)
-
-	case RUN_COMMAND:
-		specificTask := task.(*runCommandTask)
-		return gui.newCmdTask(view, specificTask.cmd, specificTask.prefix)
-
-	case RUN_PTY:
-		specificTask := task.(*runPtyTask)
-		return gui.newPtyTask(view, specificTask.cmd, specificTask.prefix)
+	case *types.RunDiffRendererTask:
+		return gui.newRenderTask(view, v.Cmd, v.Prefix)
 	}
 
 	return nil
 }
 
-func (gui *Gui) refreshMainView(opts *viewUpdateOpts, view *gocui.View) error {
-	view.Title = opts.title
-	view.Wrap = !opts.noWrap
-	view.Highlight = opts.highlight
-
-	if err := gui.runTaskForView(view, opts.task); err != nil {
-		gui.Log.Error(err)
-		return nil
+func (gui *Gui) moveMainContextPairToTop(pair types.MainContextPair) {
+	gui.moveMainContextToTop(pair.Main)
+	if pair.Secondary != nil {
+		gui.moveMainContextToTop(pair.Secondary)
 	}
-
-	return nil
 }
 
-func (gui *Gui) refreshMainViews(opts refreshMainOpts) error {
-	if opts.main != nil {
-		if err := gui.refreshMainView(opts.main, gui.Views.Main); err != nil {
-			return err
+func (gui *Gui) moveMainContextToTop(context types.Context) {
+	gui.helpers.Window.SetWindowContext(context)
+
+	view := context.GetView()
+
+	topView := gui.helpers.Window.TopViewInWindow(context.GetWindowName(), true)
+
+	if topView != nil && topView != view {
+		// We need to copy the content to avoid a flicker effect: If we're flicking
+		// through files in the files panel, we use a different view to render the
+		// files vs the directories, and if you select dir A, then file B, then dir
+		// C, you'll briefly see dir A's contents again before the view is updated.
+		// So here we're copying the content from the top window to avoid that
+		// flicker effect.
+		gui.g.CopyContent(topView, view)
+
+		if err := gui.g.SetViewOnTopOf(view.Name(), topView.Name()); err != nil {
+			gui.Log.Error(err)
+		}
+	}
+}
+
+func (gui *Gui) RefreshMainView(opts *types.ViewUpdateOpts, context types.Context) {
+	view := context.GetView()
+
+	if opts.Title != "" {
+		view.Title = opts.Title
+	}
+
+	view.Subtitle = opts.SubTitle
+
+	if err := gui.runTaskForView(view, opts.Task); err != nil {
+		gui.c.Log.Error(err)
+	}
+}
+
+func (gui *Gui) normalMainContextPair() types.MainContextPair {
+	return types.NewMainContextPair(
+		gui.State.Contexts.Normal,
+		gui.State.Contexts.NormalSecondary,
+	)
+}
+
+func (gui *Gui) stagingMainContextPair() types.MainContextPair {
+	return types.NewMainContextPair(
+		gui.State.Contexts.Staging,
+		gui.State.Contexts.StagingSecondary,
+	)
+}
+
+func (gui *Gui) patchBuildingMainContextPair() types.MainContextPair {
+	return types.NewMainContextPair(
+		gui.State.Contexts.CustomPatchBuilder,
+		gui.State.Contexts.CustomPatchBuilderSecondary,
+	)
+}
+
+func (gui *Gui) mergingMainContextPair() types.MainContextPair {
+	return types.NewMainContextPair(
+		gui.State.Contexts.MergeConflicts,
+		nil,
+	)
+}
+
+func (gui *Gui) allMainContextPairs() []types.MainContextPair {
+	return []types.MainContextPair{
+		gui.normalMainContextPair(),
+		gui.stagingMainContextPair(),
+		gui.patchBuildingMainContextPair(),
+		gui.mergingMainContextPair(),
+	}
+}
+
+func (gui *Gui) refreshMainViews(opts types.RefreshMainOpts) {
+	gui.moveMainContextPairToTop(opts.Pair)
+
+	if opts.Main != nil {
+		gui.RefreshMainView(opts.Main, opts.Pair.Main)
+	}
+
+	if opts.Secondary != nil {
+		gui.RefreshMainView(opts.Secondary, opts.Pair.Secondary)
+	} else if opts.Pair.Secondary != nil {
+		opts.Pair.Secondary.GetView().Clear()
+	}
+
+	// Reset the scroll positions of all the other main views. We do this after
+	// moving this pair to the top (which copies the previously-shown view's
+	// content into the now-visible one to avoid a blank frame): resetting first
+	// would zero that source view's scroll before it gets copied, forcing the
+	// placeholder to the top instead of leaving it where the screen already was.
+	for _, pair := range gui.allMainContextPairs() {
+		if pair.Main != opts.Pair.Main {
+			pair.Main.GetView().SetOrigin(0, 0)
+		}
+		if pair.Secondary != nil && pair.Secondary != opts.Pair.Secondary {
+			pair.Secondary.GetView().SetOrigin(0, 0)
 		}
 	}
 
-	if opts.secondary != nil {
-		if err := gui.refreshMainView(opts.secondary, gui.Views.Secondary); err != nil {
-			return err
-		}
-	}
-
-	gui.splitMainPanel(opts.secondary != nil)
-
-	return nil
+	gui.splitMainPanel(opts.Secondary != nil)
 }
 
 func (gui *Gui) splitMainPanel(splitMainPanel bool) {
 	gui.State.SplitMainPanel = splitMainPanel
 }
 
-func (gui *Gui) isMainPanelSplit() bool {
-	return gui.State.SplitMainPanel
+// reApplySearch runs a search the view holds again over the content a render has just
+// finished putting there, so that the matches highlighted and the "x of y" status
+// describe what the view shows now rather than what it showed when the search was
+// typed. Call it once the content is final.
+func (gui *Gui) reApplySearch(view *gocui.View) {
+	// While the prompt is open, the search view holds what the user is typing, and the
+	// status would be written over it.
+	if gui.State.ContextMgr.Current().GetKey() == context.SEARCH_CONTEXT_KEY {
+		return
+	}
+
+	view.RefreshSearch()
 }

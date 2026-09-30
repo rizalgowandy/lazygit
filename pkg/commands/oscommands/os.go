@@ -1,18 +1,17 @@
 package oscommands
 
 import (
-	"fmt"
-	"io/ioutil"
+	"bytes"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/go-errors/errors"
 
 	"github.com/atotto/clipboard"
 	"github.com/jesseduffield/lazygit/pkg/common"
+	"github.com/jesseduffield/lazygit/pkg/config"
 	"github.com/jesseduffield/lazygit/pkg/utils"
 )
 
@@ -20,108 +19,51 @@ import (
 type OSCommand struct {
 	*common.Common
 	Platform *Platform
-	Getenv   func(string) string
+	getenvFn func(string) string
+	guiIO    *guiIO
 
-	// callback to run before running a command, i.e. for the purposes of logging
-	onRunCommand func(CmdLogEntry)
-
-	// something like 'Staging File': allows us to group cmd logs under a single title
-	CmdLogSpan string
-
-	removeFile func(string) error
+	removeFileFn func(string) error
+	isDirEmptyFn func(string) (bool, error)
+	removeDirFn  func(string) error
 
 	Cmd *CmdObjBuilder
+
+	tempDir string
 }
 
 // Platform stores the os state
 type Platform struct {
-	OS              string
-	Shell           string
-	ShellArg        string
-	OpenCommand     string
-	OpenLinkCommand string
-}
-
-// TODO: make these fields private
-type CmdLogEntry struct {
-	// e.g. 'git commit -m "haha"'
-	cmdStr string
-	// Span is something like 'Staging File'. Multiple commands can be grouped under the same
-	// span
-	span string
-
-	// sometimes our command is direct like 'git commit', and sometimes it's a
-	// command to remove a file but through Go's standard library rather than the
-	// command line
-	commandLine bool
-}
-
-func (e CmdLogEntry) GetCmdStr() string {
-	return e.cmdStr
-}
-
-func (e CmdLogEntry) GetSpan() string {
-	return e.span
-}
-
-func (e CmdLogEntry) GetCommandLine() bool {
-	return e.commandLine
-}
-
-func NewCmdLogEntry(cmdStr string, span string, commandLine bool) CmdLogEntry {
-	return CmdLogEntry{cmdStr: cmdStr, span: span, commandLine: commandLine}
+	OS                          string
+	Shell                       string
+	ShellArg                    string
+	PrefixForShellFunctionsFile string
+	OpenCommand                 string
+	OpenLinkCommand             string
 }
 
 // NewOSCommand os command runner
-func NewOSCommand(common *common.Common, platform *Platform) *OSCommand {
+func NewOSCommand(common *common.Common, config config.AppConfigurer, platform *Platform, guiIO *guiIO) *OSCommand {
 	c := &OSCommand{
-		Common:     common,
-		Platform:   platform,
-		Getenv:     os.Getenv,
-		removeFile: os.RemoveAll,
+		Common:       common,
+		Platform:     platform,
+		getenvFn:     os.Getenv,
+		removeFileFn: os.RemoveAll,
+		isDirEmptyFn: isDirEmpty,
+		removeDirFn:  os.Remove,
+		guiIO:        guiIO,
+		tempDir:      config.GetTempDir(),
 	}
 
-	runner := &cmdObjRunner{log: common.Log, logCmdObj: c.LogCmdObj}
-	c.Cmd = &CmdObjBuilder{runner: runner, logCmdObj: c.LogCmdObj, platform: platform}
+	runner := &cmdObjRunner{log: common.Log, guiIO: guiIO}
+	c.Cmd = &CmdObjBuilder{runner: runner, platform: platform}
 
 	return c
-}
-
-func (c *OSCommand) WithSpan(span string) *OSCommand {
-	// sometimes .WithSpan(span) will be called where span actually is empty, in
-	// which case we don't need to log anything so we can just return early here
-	// with the original struct
-	if span == "" {
-		return c
-	}
-
-	newOSCommand := &OSCommand{}
-	*newOSCommand = *c
-	newOSCommand.CmdLogSpan = span
-	newOSCommand.Cmd.logCmdObj = newOSCommand.LogCmdObj
-	newOSCommand.Cmd.runner = &cmdObjRunner{log: c.Log, logCmdObj: newOSCommand.LogCmdObj}
-	return newOSCommand
-}
-
-func (c *OSCommand) LogCmdObj(cmdObj ICmdObj) {
-	c.LogCommand(cmdObj.ToString(), true)
 }
 
 func (c *OSCommand) LogCommand(cmdStr string, commandLine bool) {
 	c.Log.WithField("command", cmdStr).Info("RunCommand")
 
-	if c.onRunCommand != nil && c.CmdLogSpan != "" {
-		c.onRunCommand(NewCmdLogEntry(cmdStr, c.CmdLogSpan, commandLine))
-	}
-}
-
-func (c *OSCommand) SetOnRunCommand(f func(CmdLogEntry)) {
-	c.onRunCommand = f
-}
-
-// To be used for testing only
-func (c *OSCommand) SetRemoveFile(f func(string) error) {
-	c.removeFile = f
+	c.guiIO.logCommandFn(cmdStr, commandLine)
 }
 
 // FileType tells us if the file is a file, directory or other
@@ -137,23 +79,28 @@ func FileType(path string) string {
 }
 
 func (c *OSCommand) OpenFile(filename string) error {
-	commandTemplate := c.UserConfig.OS.OpenCommand
+	commandTemplate := c.UserConfig().OS.Open
+	if commandTemplate == "" {
+		commandTemplate = config.GetPlatformDefaultConfig().Open
+	}
 	templateValues := map[string]string{
 		"filename": c.Quote(filename),
 	}
 	command := utils.ResolvePlaceholderString(commandTemplate, templateValues)
-	return c.Cmd.NewShell(command).Run()
+	return c.Cmd.NewShell(command, c.UserConfig().OS.ShellFunctionsFile).Run()
 }
 
 func (c *OSCommand) OpenLink(link string) error {
-	c.LogCommand(fmt.Sprintf("Opening link '%s'", link), false)
-	commandTemplate := c.UserConfig.OS.OpenLinkCommand
+	commandTemplate := c.UserConfig().OS.OpenLink
+	if commandTemplate == "" {
+		commandTemplate = config.GetPlatformDefaultConfig().OpenLink
+	}
 	templateValues := map[string]string{
 		"link": c.Quote(link),
 	}
 
 	command := utils.ResolvePlaceholderString(commandTemplate, templateValues)
-	return c.Cmd.NewShell(command).Run()
+	return c.Cmd.NewShell(command, c.UserConfig().OS.ShellFunctionsFile).Run()
 }
 
 // Quote wraps a message in platform-specific quotation marks
@@ -161,72 +108,66 @@ func (c *OSCommand) Quote(message string) string {
 	return c.Cmd.Quote(message)
 }
 
-func (self *CmdObjBuilder) Quote(message string) string {
-	var quote string
-	if self.platform.OS == "windows" {
-		quote = `\"`
-		message = strings.NewReplacer(
-			`"`, `"'"'"`,
-			`\"`, `\\"`,
-		).Replace(message)
-	} else {
-		quote = `"`
-		message = strings.NewReplacer(
-			`\`, `\\`,
-			`"`, `\"`,
-			`$`, `\$`,
-			"`", "\\`",
-		).Replace(message)
-	}
-	return quote + message + quote
-}
-
 // AppendLineToFile adds a new line in file
 func (c *OSCommand) AppendLineToFile(filename, line string) error {
-	c.LogCommand(fmt.Sprintf("Appending '%s' to file '%s'", line, filename), false)
-	f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	msg := utils.ResolvePlaceholderString(
+		c.Tr.Log.AppendingLineToFile,
+		map[string]string{
+			"line":     line,
+			"filename": filename,
+		},
+	)
+	c.LogCommand(msg, false)
+
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return utils.WrapError(err)
 	}
 	defer f.Close()
 
-	_, err = f.WriteString("\n" + line)
+	info, err := os.Stat(filename)
+	if err != nil {
+		return utils.WrapError(err)
+	}
+
+	if info.Size() > 0 {
+		// read last char
+		buf := make([]byte, 1)
+		if _, err := f.ReadAt(buf, info.Size()-1); err != nil {
+			return utils.WrapError(err)
+		}
+
+		// if the last byte of the file is not a newline, add it
+		if []byte("\n")[0] != buf[0] {
+			_, err = f.WriteString("\n")
+		}
+	}
+
+	if err == nil {
+		_, err = f.WriteString(line + "\n")
+	}
+
 	if err != nil {
 		return utils.WrapError(err)
 	}
 	return nil
 }
 
-// CreateTempFile writes a string to a new temp file and returns the file's name
-func (c *OSCommand) CreateTempFile(filename, content string) (string, error) {
-	tmpfile, err := ioutil.TempFile("", filename)
-	if err != nil {
-		c.Log.Error(err)
-		return "", utils.WrapError(err)
-	}
-	c.LogCommand(fmt.Sprintf("Creating temp file '%s'", tmpfile.Name()), false)
-
-	if _, err := tmpfile.WriteString(content); err != nil {
-		c.Log.Error(err)
-		return "", utils.WrapError(err)
-	}
-	if err := tmpfile.Close(); err != nil {
-		c.Log.Error(err)
-		return "", utils.WrapError(err)
-	}
-
-	return tmpfile.Name(), nil
-}
-
 // CreateFileWithContent creates a file with the given content
 func (c *OSCommand) CreateFileWithContent(path string, content string) error {
-	c.LogCommand(fmt.Sprintf("Creating file '%s'", path), false)
+	msg := utils.ResolvePlaceholderString(
+		c.Tr.Log.CreateFileWithContent,
+		map[string]string{
+			"path": path,
+		},
+	)
+	c.LogCommand(msg, false)
 	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
 		c.Log.Error(err)
 		return err
 	}
 
-	if err := ioutil.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		c.Log.Error(err)
 		return utils.WrapError(err)
 	}
@@ -236,7 +177,13 @@ func (c *OSCommand) CreateFileWithContent(path string, content string) error {
 
 // Remove removes a file or directory at the specified path
 func (c *OSCommand) Remove(filename string) error {
-	c.LogCommand(fmt.Sprintf("Removing '%s'", filename), false)
+	msg := utils.ResolvePlaceholderString(
+		c.Tr.Log.Remove,
+		map[string]string{
+			"filename": filename,
+		},
+	)
+	c.LogCommand(msg, false)
 	err := os.RemoveAll(filename)
 	return utils.WrapError(err)
 }
@@ -252,72 +199,38 @@ func (c *OSCommand) FileExists(path string) (bool, error) {
 	return true, nil
 }
 
-// GetLazygitPath returns the path of the currently executed file
-func (c *OSCommand) GetLazygitPath() string {
-	ex, err := os.Executable() // get the executable path for git to use
-	if err != nil {
-		ex = os.Args[0] // fallback to the first call argument if needed
-	}
-	return `"` + filepath.ToSlash(ex) + `"`
-}
-
 // PipeCommands runs a heap of commands and pipes their inputs/outputs together like A | B | C
-func (c *OSCommand) PipeCommands(commandStrings ...string) error {
-	cmds := make([]*exec.Cmd, len(commandStrings))
-	logCmdStr := ""
-	for i, str := range commandStrings {
-		if i > 0 {
-			logCmdStr += " | "
-		}
-		logCmdStr += str
-		cmds[i] = c.Cmd.New(str).GetCmd()
-	}
-	c.LogCommand(logCmdStr, true)
+func (c *OSCommand) PipeCommands(cmdObjs ...*CmdObj) error {
+	c.logPipeline(cmdObjs)
 
-	for i := 0; i < len(cmds)-1; i++ {
-		stdout, err := cmds[i].StdoutPipe()
-		if err != nil {
-			return err
-		}
-
-		cmds[i+1].Stdin = stdout
+	cmds, parentEnds, err := wirePipeline(cmdObjs)
+	if err != nil {
+		return err
 	}
 
-	// keeping this here in case I adapt this code for some other purpose in the future
-	// cmds[len(cmds)-1].Stdout = os.Stdout
+	stderrs := make([]bytes.Buffer, len(cmds))
+	for i := range cmds {
+		cmds[i].Stderr = &stderrs[i]
+	}
+
+	started, startErr := startPipeline(cmds, parentEnds)
 
 	finalErrors := []string{}
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(cmds))
-
-	for _, cmd := range cmds {
-		currentCmd := cmd
-		go utils.Safe(func() {
-			stderr, err := currentCmd.StderrPipe()
-			if err != nil {
-				c.Log.Error(err)
-			}
-
-			if err := currentCmd.Start(); err != nil {
-				c.Log.Error(err)
-			}
-
-			if b, err := ioutil.ReadAll(stderr); err == nil {
-				if len(b) > 0 {
-					finalErrors = append(finalErrors, string(b))
-				}
-			}
-
-			if err := currentCmd.Wait(); err != nil {
-				c.Log.Error(err)
-			}
-
-			wg.Done()
-		})
+	if startErr != nil {
+		c.Log.Error(startErr)
+		finalErrors = append(finalErrors, startErr.Error())
 	}
 
-	wg.Wait()
+	for i, cmd := range cmds[:started] {
+		if err := cmd.Wait(); err != nil {
+			c.Log.Error(err)
+		}
+
+		if stderrs[i].Len() > 0 {
+			finalErrors = append(finalErrors, stderrs[i].String())
+		}
+	}
 
 	if len(finalErrors) > 0 {
 		return errors.New(strings.Join(finalErrors, "\n"))
@@ -325,27 +238,98 @@ func (c *OSCommand) PipeCommands(commandStrings ...string) error {
 	return nil
 }
 
-func Kill(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
-		// somebody got to it before we were able to, poor bastard
-		return nil
-	}
-	return cmd.Process.Kill()
-}
-
 func (c *OSCommand) CopyToClipboard(str string) error {
-	escaped := strings.Replace(str, "\n", "\\n", -1)
+	escaped := strings.ReplaceAll(str, "\n", "\\n")
 	truncated := utils.TruncateWithEllipsis(escaped, 40)
-	c.LogCommand(fmt.Sprintf("Copying '%s' to clipboard", truncated), false)
+
+	msg := utils.ResolvePlaceholderString(
+		c.Tr.Log.CopyToClipboard,
+		map[string]string{
+			"str": truncated,
+		},
+	)
+	c.LogCommand(msg, false)
+	if c.UserConfig().OS.CopyToClipboardCmd != "" {
+		cmdStr := utils.ResolvePlaceholderString(c.UserConfig().OS.CopyToClipboardCmd, map[string]string{
+			"text": c.Cmd.Quote(str),
+		})
+		return c.Cmd.NewShell(cmdStr, c.UserConfig().OS.ShellFunctionsFile).Run()
+	}
+
 	return clipboard.WriteAll(str)
 }
 
-func (c *OSCommand) RemoveFile(path string) error {
-	c.LogCommand(fmt.Sprintf("Deleting path '%s'", path), false)
+func (c *OSCommand) PasteFromClipboard() (string, error) {
+	var s string
+	var err error
+	if c.UserConfig().OS.CopyToClipboardCmd != "" {
+		cmdStr := c.UserConfig().OS.ReadFromClipboardCmd
+		s, err = c.Cmd.NewShell(cmdStr, c.UserConfig().OS.ShellFunctionsFile).RunWithOutput()
+	} else {
+		s, err = clipboard.ReadAll()
+	}
 
-	return c.removeFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.ReplaceAll(s, "\r\n", "\n"), nil
 }
 
-func GetTempDir() string {
-	return filepath.Join(os.TempDir(), "lazygit")
+func (c *OSCommand) RemoveFile(path string) error {
+	msg := utils.ResolvePlaceholderString(
+		c.Tr.Log.RemoveFile,
+		map[string]string{
+			"path": path,
+		},
+	)
+	c.LogCommand(msg, false)
+
+	return c.removeFileFn(path)
+}
+
+func (c *OSCommand) IsDirEmpty(path string) (bool, error) {
+	return c.isDirEmptyFn(path)
+}
+
+func (c *OSCommand) RemoveDir(path string) error {
+	msg := utils.ResolvePlaceholderString(
+		c.Tr.Log.RemoveEmptyDir,
+		map[string]string{
+			"path": path,
+		},
+	)
+	c.LogCommand(msg, false)
+
+	return c.removeDirFn(path)
+}
+
+func isDirEmpty(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	_, err = f.Readdirnames(1)
+	_ = f.Close()
+	if errors.Is(err, io.EOF) {
+		return true, nil
+	}
+	return false, err
+}
+
+func (c *OSCommand) Getenv(key string) string {
+	return c.getenvFn(key)
+}
+
+func (c *OSCommand) GetTempDir() string {
+	return c.tempDir
+}
+
+// GetLazygitPath returns the path of the currently executed file
+func GetLazygitPath() string {
+	ex, err := os.Executable() // get the executable path for git to use
+	if err != nil {
+		ex = os.Args[0] // fallback to the first call argument if needed
+	}
+	return `"` + filepath.ToSlash(ex) + `"`
 }

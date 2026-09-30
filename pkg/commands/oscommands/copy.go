@@ -1,9 +1,8 @@
 package oscommands
 
 import (
-	"fmt"
+	"errors"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 )
@@ -36,16 +35,16 @@ import (
 // destination file exists, all it's contents will be replaced by the contents
 // of the source file. The file mode will be copied from the source and
 // the copied data is synced/flushed to stable storage.
-func CopyFile(src, dst string) (err error) {
+func CopyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
-		return
+		return err
 	}
 	defer in.Close()
 
 	out, err := os.Create(dst)
 	if err != nil {
-		return
+		return err
 	}
 	defer func() {
 		if e := out.Close(); e != nil {
@@ -55,30 +54,30 @@ func CopyFile(src, dst string) (err error) {
 
 	_, err = io.Copy(out, in)
 	if err != nil {
-		return
+		return err
 	}
 
 	err = out.Sync()
 	if err != nil {
-		return
+		return err
 	}
 
 	si, err := os.Stat(src)
 	if err != nil {
-		return
+		return err
 	}
 	err = os.Chmod(dst, si.Mode())
 	if err != nil {
-		return
+		return err
 	}
 
-	return
+	return err
 }
 
 // CopyDir recursively copies a directory tree, attempting to preserve permissions.
 // Source directory must exist. If destination already exists we'll clobber it.
 // Symlinks are ignored and skipped.
-func CopyDir(src string, dst string) (err error) {
+func CopyDir(src string, dst string) error {
 	src = filepath.Clean(src)
 	dst = filepath.Clean(dst)
 
@@ -87,12 +86,12 @@ func CopyDir(src string, dst string) (err error) {
 		return err
 	}
 	if !si.IsDir() {
-		return fmt.Errorf("source is not a directory")
+		return errors.New("source is not a directory")
 	}
 
 	_, err = os.Stat(dst)
 	if err != nil && !os.IsNotExist(err) {
-		return
+		return err
 	}
 	if err == nil {
 		// it exists so let's remove it
@@ -103,12 +102,12 @@ func CopyDir(src string, dst string) (err error) {
 
 	err = os.MkdirAll(dst, si.Mode())
 	if err != nil {
-		return
+		return err
 	}
 
-	entries, err := ioutil.ReadDir(src)
+	entries, err := os.ReadDir(src)
 	if err != nil {
-		return
+		return err
 	}
 
 	for _, entry := range entries {
@@ -118,20 +117,26 @@ func CopyDir(src string, dst string) (err error) {
 		if entry.IsDir() {
 			err = CopyDir(srcPath, dstPath)
 			if err != nil {
-				return
+				return err
 			}
 		} else {
+			var info os.FileInfo
+			info, err = entry.Info()
+			if err != nil {
+				return err
+			}
+
 			// Skip symlinks.
-			if entry.Mode()&os.ModeSymlink != 0 {
+			if info.Mode()&os.ModeSymlink != 0 {
 				continue
 			}
 
 			err = CopyFile(srcPath, dstPath)
 			if err != nil {
-				return
+				return err
 			}
 		}
 	}
 
-	return
+	return err
 }

@@ -1,21 +1,21 @@
 package config
 
 import (
-	yaml "github.com/jesseduffield/yaml"
+	"gopkg.in/yaml.v3"
 )
 
 // NewDummyAppConfig creates a new dummy AppConfig for testing
 func NewDummyAppConfig() *AppConfig {
+	userConfig := GetDefaultConfig()
+	userConfig.Keybinding.MergeLegacyAltKeybindings()
 	appConfig := &AppConfig{
-		Name:        "lazygit",
-		Version:     "unversioned",
-		Commit:      "",
-		BuildDate:   "",
-		Debug:       false,
-		BuildSource: "",
-		UserConfig:  GetDefaultConfig(),
-		AppState:    &AppState{},
+		name:                   "lazygit",
+		version:                "unversioned",
+		debug:                  false,
+		userConfig:             userConfig,
+		appState:               &AppState{},
+		githubPullRequestCache: newGithubPullRequestCache(""),
 	}
-	_ = yaml.Unmarshal([]byte{}, appConfig.AppState)
+	_ = yaml.Unmarshal([]byte{}, appConfig.appState)
 	return appConfig
 }

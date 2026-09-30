@@ -17,6 +17,19 @@ func (self *FakeGitConfig) Get(key string) string {
 	return self.mockResponses[key]
 }
 
+func (self *FakeGitConfig) GetGeneral(args string) string {
+	if self.mockResponses == nil {
+		return ""
+	}
+	return self.mockResponses[args]
+}
+
 func (self *FakeGitConfig) GetBool(key string) bool {
 	return isTruthy(self.Get(key))
+}
+
+func (self *FakeGitConfig) SetDir(dir string) {
+}
+
+func (self *FakeGitConfig) DropCache() {
 }

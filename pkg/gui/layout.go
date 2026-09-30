@@ -1,138 +1,20 @@
 package gui
 
 import (
-	"github.com/jesseduffield/gocui"
-	"github.com/jesseduffield/lazygit/pkg/theme"
+	"errors"
+
+	"github.com/jesseduffield/lazygit/pkg/gocui"
+	"github.com/jesseduffield/lazygit/pkg/gui/types"
+	"github.com/jesseduffield/lazygit/pkg/utils"
+	"github.com/samber/lo"
 )
-
-const SEARCH_PREFIX = "search: "
-
-func (gui *Gui) createAllViews() error {
-	viewNameMappings := []struct {
-		viewPtr **gocui.View
-		name    string
-	}{
-		{viewPtr: &gui.Views.Status, name: "status"},
-		{viewPtr: &gui.Views.Files, name: "files"},
-		{viewPtr: &gui.Views.Branches, name: "branches"},
-		{viewPtr: &gui.Views.Commits, name: "commits"},
-		{viewPtr: &gui.Views.Stash, name: "stash"},
-		{viewPtr: &gui.Views.CommitFiles, name: "commitFiles"},
-		{viewPtr: &gui.Views.Main, name: "main"},
-		{viewPtr: &gui.Views.Secondary, name: "secondary"},
-		{viewPtr: &gui.Views.Options, name: "options"},
-		{viewPtr: &gui.Views.AppStatus, name: "appStatus"},
-		{viewPtr: &gui.Views.Information, name: "information"},
-		{viewPtr: &gui.Views.Search, name: "search"},
-		{viewPtr: &gui.Views.SearchPrefix, name: "searchPrefix"},
-		{viewPtr: &gui.Views.CommitMessage, name: "commitMessage"},
-		{viewPtr: &gui.Views.Credentials, name: "credentials"},
-		{viewPtr: &gui.Views.Menu, name: "menu"},
-		{viewPtr: &gui.Views.Suggestions, name: "suggestions"},
-		{viewPtr: &gui.Views.Confirmation, name: "confirmation"},
-		{viewPtr: &gui.Views.Limit, name: "limit"},
-		{viewPtr: &gui.Views.Extras, name: "extras"},
-	}
-
-	var err error
-	for _, mapping := range viewNameMappings {
-		*mapping.viewPtr, err = gui.prepareView(mapping.name)
-		if err != nil && err.Error() != UNKNOWN_VIEW_ERROR_MSG {
-			return err
-		}
-	}
-
-	gui.Views.Options.Frame = false
-	gui.Views.Options.FgColor = theme.OptionsColor
-
-	gui.Views.SearchPrefix.BgColor = gocui.ColorDefault
-	gui.Views.SearchPrefix.FgColor = gocui.ColorGreen
-	gui.Views.SearchPrefix.Frame = false
-	gui.setViewContentSync(gui.Views.SearchPrefix, SEARCH_PREFIX)
-
-	gui.Views.Stash.Title = gui.Tr.StashTitle
-	gui.Views.Stash.FgColor = theme.GocuiDefaultTextColor
-
-	gui.Views.Commits.Title = gui.Tr.CommitsTitle
-	gui.Views.Commits.FgColor = theme.GocuiDefaultTextColor
-
-	gui.Views.CommitFiles.Title = gui.Tr.CommitFiles
-	gui.Views.CommitFiles.FgColor = theme.GocuiDefaultTextColor
-
-	gui.Views.Branches.Title = gui.Tr.BranchesTitle
-	gui.Views.Branches.FgColor = theme.GocuiDefaultTextColor
-
-	gui.Views.Files.Highlight = true
-	gui.Views.Files.Title = gui.Tr.FilesTitle
-	gui.Views.Files.FgColor = theme.GocuiDefaultTextColor
-
-	gui.Views.Secondary.Title = gui.Tr.DiffTitle
-	gui.Views.Secondary.Wrap = true
-	gui.Views.Secondary.FgColor = theme.GocuiDefaultTextColor
-	gui.Views.Secondary.IgnoreCarriageReturns = true
-
-	gui.Views.Main.Title = gui.Tr.DiffTitle
-	gui.Views.Main.Wrap = true
-	gui.Views.Main.FgColor = theme.GocuiDefaultTextColor
-	gui.Views.Main.IgnoreCarriageReturns = true
-
-	gui.Views.Limit.Title = gui.Tr.NotEnoughSpace
-	gui.Views.Limit.Wrap = true
-
-	gui.Views.Status.Title = gui.Tr.StatusTitle
-	gui.Views.Status.FgColor = theme.GocuiDefaultTextColor
-
-	gui.Views.Search.BgColor = gocui.ColorDefault
-	gui.Views.Search.FgColor = gocui.ColorGreen
-	gui.Views.Search.Frame = false
-	gui.Views.Search.Editable = true
-
-	gui.Views.AppStatus.BgColor = gocui.ColorDefault
-	gui.Views.AppStatus.FgColor = gocui.ColorCyan
-	gui.Views.AppStatus.Frame = false
-	gui.Views.AppStatus.Visible = false
-
-	gui.Views.CommitMessage.Visible = false
-	gui.Views.CommitMessage.Title = gui.Tr.CommitMessage
-	gui.Views.CommitMessage.FgColor = theme.GocuiDefaultTextColor
-	gui.Views.CommitMessage.Editable = true
-	gui.Views.CommitMessage.Editor = gocui.EditorFunc(gui.commitMessageEditor)
-
-	gui.Views.Confirmation.Visible = false
-
-	gui.Views.Credentials.Visible = false
-	gui.Views.Credentials.Title = gui.Tr.CredentialsUsername
-	gui.Views.Credentials.FgColor = theme.GocuiDefaultTextColor
-	gui.Views.Credentials.Editable = true
-
-	gui.Views.Suggestions.Visible = false
-
-	gui.Views.Menu.Visible = false
-
-	gui.Views.Information.BgColor = gocui.ColorDefault
-	gui.Views.Information.FgColor = gocui.ColorGreen
-	gui.Views.Information.Frame = false
-
-	gui.Views.Extras.Title = gui.Tr.CommandLog
-	gui.Views.Extras.FgColor = theme.GocuiDefaultTextColor
-	gui.Views.Extras.Autoscroll = true
-	gui.Views.Extras.Wrap = true
-
-	gui.printCommandLogHeader()
-
-	if _, err := gui.g.SetCurrentView(gui.defaultSideContext().GetViewName()); err != nil {
-		return err
-	}
-
-	gui.GitCommand.GetCmdWriter = gui.getCmdWriter
-
-	return nil
-}
 
 // layout is called for every screen re-render e.g. when the screen is resized
 func (gui *Gui) layout(g *gocui.Gui) error {
 	if !gui.ViewsSetup {
-		if err := gui.createAllViews(); err != nil {
+		gui.printCommandLogHeader()
+
+		if _, err := gui.g.SetCurrentView(gui.defaultSideContext().GetViewName()); err != nil {
 			return err
 		}
 	}
@@ -140,56 +22,105 @@ func (gui *Gui) layout(g *gocui.Gui) error {
 	g.Highlight = true
 	width, height := g.Size()
 
-	minimumHeight := 9
-	minimumWidth := 10
-	var err error
-	_, err = g.SetView("limit", 0, 0, width-1, height-1, 0)
-	if err != nil && err.Error() != UNKNOWN_VIEW_ERROR_MSG {
-		return err
-	}
-	gui.Views.Limit.Visible = height < minimumHeight || width < minimumWidth
-
 	informationStr := gui.informationStr()
-	appStatus := gui.statusManager.getStatusString()
+
+	var appStatus string
+	appStatusView, err := g.View("appStatus")
+	if err == nil {
+		appStatus = utils.Decolorise(appStatusView.Buffer())
+	}
 
 	viewDimensions := gui.getWindowDimensions(informationStr, appStatus)
 
 	// reading more lines into main view buffers upon resize
 	prevMainView := gui.Views.Main
 	if prevMainView != nil {
-		_, prevMainHeight := prevMainView.Size()
-		newMainHeight := viewDimensions["main"].Y1 - viewDimensions["main"].Y0 - 1
-		heightDiff := newMainHeight - prevMainHeight
-		if heightDiff > 0 {
-			if manager, ok := gui.viewBufferManagerMap["main"]; ok {
-				manager.ReadLines(heightDiff)
+		prevMainHeight := prevMainView.Height()
+		newMainHeight := viewDimensions["main"].Y1 - viewDimensions["main"].Y0 + 1
+		if newMainHeight > prevMainHeight {
+			// The main views have grown taller, so make sure enough lines are
+			// loaded to fill them. The views haven't been resized yet at this
+			// point, so we can't rely on their current height; compute the target
+			// total from the new height instead. (Reading past the actual content
+			// is harmless: ReadLines stops at the end of input.)
+			linesToRead := prevMainView.OriginY() + newMainHeight
+			if manager := gui.getViewBufferManagerForView(gui.Views.Main); manager != nil {
+				manager.ReadLines(linesToRead)
 			}
-			if manager, ok := gui.viewBufferManagerMap["secondary"]; ok {
-				manager.ReadLines(heightDiff)
+			if manager := gui.getViewBufferManagerForView(gui.Views.Secondary); manager != nil {
+				manager.ReadLines(linesToRead)
 			}
 		}
 	}
 
-	setViewFromDimensions := func(viewName string, windowName string, frame bool) (*gocui.View, error) {
+	contextsToRerender := []types.Context{}
+
+	// we assume that the view has already been created.
+	setViewFromDimensions := func(context types.Context) (*gocui.View, error) {
+		viewName := context.GetViewName()
+		windowName := context.GetWindowName()
+
 		dimensionsObj, ok := viewDimensions[windowName]
+
+		view, err := g.View(viewName)
+		if err != nil {
+			return nil, err
+		}
 
 		if !ok {
 			// view not specified in dimensions object: so create the view and hide it
 			// making the view take up the whole space in the background in case it needs
 			// to render content as soon as it appears, because lazyloaded content (via a pty task)
 			// cares about the size of the view.
-			view, err := g.SetView(viewName, 0, 0, width, height, 0)
-			if view != nil {
-				view.Visible = false
-			}
+			_, err := g.SetView(viewName, 0, 0, width, height, 0)
+			view.Visible = false
 			return view, err
 		}
 
 		frameOffset := 1
-		if frame {
+		if view.Frame {
 			frameOffset = 0
 		}
-		view, err := g.SetView(
+
+		mustRerender := false
+		newHeight := dimensionsObj.Y1 - dimensionsObj.Y0 + 2*frameOffset
+		maxOriginY := context.TotalContentHeight()
+		if !view.CanScrollPastBottom {
+			maxOriginY -= newHeight - 1
+		}
+		// Don't scroll up while the view's content is still being loaded: its
+		// height only reflects what has been read so far, so clamping to it now
+		// would yank the view to the top even though more content is on the way
+		// (e.g. when re-rendering a diff the user was scrolled into).
+		manager := gui.getViewBufferManagerForView(view)
+		stillLoading := manager != nil && manager.IsLoading()
+		if oldOriginY := view.OriginY(); oldOriginY > maxOriginY && !stillLoading {
+			view.ScrollUp(oldOriginY - maxOriginY)
+			// the view might not have scrolled actually (if it was at the limit
+			// already), so we need to check if it did
+			if oldOriginY != view.OriginY() && context.NeedsRerenderOnHeightChange() {
+				mustRerender = true
+			}
+		}
+		if context.NeedsRerenderOnWidthChange() == types.NEEDS_RERENDER_ON_WIDTH_CHANGE_WHEN_WIDTH_CHANGES {
+			oldWidth := view.Width()
+			newWidth := dimensionsObj.X1 - dimensionsObj.X0 + 1
+			if oldWidth != newWidth {
+				mustRerender = true
+			}
+		}
+		if context.NeedsRerenderOnHeightChange() {
+			oldHeight := view.Height()
+			newHeight := dimensionsObj.Y1 - dimensionsObj.Y0 + 1
+			if oldHeight != newHeight {
+				mustRerender = true
+			}
+		}
+		if mustRerender {
+			contextsToRerender = append(contextsToRerender, context)
+		}
+
+		_, err = g.SetView(
 			viewName,
 			dimensionsObj.X0-frameOffset,
 			dimensionsObj.Y0-frameOffset,
@@ -197,54 +128,69 @@ func (gui *Gui) layout(g *gocui.Gui) error {
 			dimensionsObj.Y1+frameOffset,
 			0,
 		)
-
-		if view != nil {
-			view.Visible = true
-		}
+		view.Visible = true
 
 		return view, err
 	}
 
-	args := []struct {
-		viewName   string
-		windowName string
-		frame      bool
-	}{
-		{viewName: "main", windowName: "main", frame: true},
-		{viewName: "secondary", windowName: "secondary", frame: true},
-		{viewName: "status", windowName: "status", frame: true},
-		{viewName: "files", windowName: "files", frame: true},
-		{viewName: "branches", windowName: "branches", frame: true},
-		{viewName: "commitFiles", windowName: gui.State.Contexts.CommitFiles.GetWindowName(), frame: true},
-		{viewName: "commits", windowName: "commits", frame: true},
-		{viewName: "stash", windowName: "stash", frame: true},
-		{viewName: "options", windowName: "options", frame: false},
-		{viewName: "searchPrefix", windowName: "searchPrefix", frame: false},
-		{viewName: "search", windowName: "search", frame: false},
-		{viewName: "appStatus", windowName: "appStatus", frame: false},
-		{viewName: "information", windowName: "information", frame: false},
-		{viewName: "extras", windowName: "extras", frame: true},
-	}
+	for _, context := range gui.State.Contexts.Flatten() {
+		if !context.HasControlledBounds() {
+			continue
+		}
 
-	for _, arg := range args {
-		_, err = setViewFromDimensions(arg.viewName, arg.windowName, arg.frame)
-		if err != nil && err.Error() != UNKNOWN_VIEW_ERROR_MSG {
+		_, err := setViewFromDimensions(context)
+		if err != nil && !errors.Is(err, gocui.ErrUnknownView) {
 			return err
 		}
 	}
 
-	// if the commit files view is the view to be displayed for its window, we'll display it
-	gui.Views.CommitFiles.Visible = gui.getViewNameForWindow(gui.State.Contexts.CommitFiles.GetWindowName()) == "commitFiles"
+	menuWithFilterRowVisible := gui.Views.Menu.Visible && gui.State.Contexts.Menu.FilterAsYouType()
+	minimumHeight := minimumScreenHeight(len(gui.helpers.Window.SideWindows()), menuWithFilterRowVisible)
+	minimumWidth := 10
+	gui.Views.Limit.Visible = height < minimumHeight || width < minimumWidth
 
-	if gui.State.OldInformation != informationStr {
-		gui.setViewContentSync(gui.Views.Information, informationStr)
-		gui.State.OldInformation = informationStr
+	filterRowVisible := gui.Views.Menu.Visible && gui.State.Contexts.Menu.FilterStarted()
+	gui.Views.MenuFilterFrame.Visible = filterRowVisible
+	gui.Views.MenuFilter.Visible = filterRowVisible
+	if gui.Views.Menu.Visible {
+		// Until the user types something there is no filter row to advertise the
+		// filter, so the menu says that typing is a thing.
+		gui.Views.Menu.Subtitle = lo.Ternary(menuWithFilterRowVisible && !filterRowVisible, gui.c.Tr.MenuFilterHint, "")
+	}
+	if menuWithFilterRowVisible {
+		// The filter input is the current view for as long as such a menu is open,
+		// so without this the cursor would sit on the menu's bottom border, where
+		// the filter row is yet to appear.
+		gui.g.Cursor = filterRowVisible
+	}
+	gui.Views.Tooltip.Visible = gui.Views.Menu.Visible && gui.Views.Tooltip.Buffer() != ""
+
+	for _, context := range gui.transientContexts() {
+		view, err := gui.g.View(context.GetViewName())
+		if err != nil && !errors.Is(err, gocui.ErrUnknownView) {
+			return err
+		}
+		// A transient view is visible if it is the view its window is currently
+		// showing — but only if that window is part of the layout at all. For a
+		// window without dimensions, setViewFromDimensions parks the view at full
+		// screen size in the background, so making it visible would cover all
+		// windows below it.
+		_, windowHasDimensions := viewDimensions[context.GetWindowName()]
+		view.Visible = windowHasDimensions &&
+			gui.helpers.Window.GetViewNameForWindow(context.GetWindowName()) == context.GetViewName()
+	}
+
+	if gui.PrevLayout.Information != informationStr {
+		gui.c.SetViewContent(gui.Views.Information, informationStr)
+		gui.PrevLayout.Information = informationStr
 	}
 
 	if !gui.ViewsSetup {
 		if err := gui.onInitialViewsCreation(); err != nil {
 			return err
 		}
+
+		gui.handleTestMode()
 
 		gui.ViewsSetup = true
 	}
@@ -257,41 +203,60 @@ func (gui *Gui) layout(g *gocui.Gui) error {
 		gui.State.ViewsSetup = true
 	}
 
-	for _, listContext := range gui.getListContexts() {
-		view, err := gui.g.View(listContext.GetViewName())
-		if err != nil {
-			continue
-		}
-
-		// ignore contexts whose view is owned by another context right now
-		if ContextKey(view.Context) != listContext.GetKey() {
-			continue
-		}
-
-		listContext.FocusLine()
-
-		view.SelBgColor = theme.GocuiSelectedLineBgColor
-
-		// I doubt this is expensive though it's admittedly redundant after the first render
-		view.SetOnSelectItem(gui.onSelectItemWrapper(listContext.onSearchSelect))
-	}
-
-	gui.Views.Main.SetOnSelectItem(gui.onSelectItemWrapper(gui.handlelineByLineNavigateTo))
-
 	mainViewWidth, mainViewHeight := gui.Views.Main.Size()
-	if mainViewWidth != gui.State.PrevMainWidth || mainViewHeight != gui.State.PrevMainHeight {
-		gui.State.PrevMainWidth = mainViewWidth
-		gui.State.PrevMainHeight = mainViewHeight
+	if mainViewWidth != gui.PrevLayout.MainWidth || mainViewHeight != gui.PrevLayout.MainHeight {
+		gui.PrevLayout.MainWidth = mainViewWidth
+		gui.PrevLayout.MainHeight = mainViewHeight
 		if err := gui.onResize(); err != nil {
 			return err
 		}
 	}
 
+	for _, context := range contextsToRerender {
+		context.HandleRender()
+	}
+
 	// here is a good place log some stuff
 	// if you run `lazygit --logs`
 	// this will let you see these branches as prettified json
-	// gui.Log.Info(utils.AsJson(gui.State.Branches[0:4]))
-	return gui.resizeCurrentPopupPanel()
+	// gui.c.Log.Info(utils.AsJson(gui.State.Model.Branches[0:4]))
+	gui.helpers.Confirmation.ResizeCurrentPopupPanels()
+
+	gui.renderContextOptionsMap()
+
+outer:
+	for {
+		select {
+		case f := <-gui.afterLayoutFuncs:
+			if err := f(); err != nil {
+				return err
+			}
+		default:
+			break outer
+		}
+	}
+
+	return nil
+}
+
+// The height below which we show the "not enough space" view instead of the
+// layout.
+func minimumScreenHeight(sideWindowCount int, menuWithFilterRowVisible bool) int {
+	// When the screen is too short the side panels are squashed, with the
+	// unfocused ones taking one row each and the focused one taking the rest. The
+	// more panels there are, the more rows the unfocused ones reserve, so the
+	// floor below which there's no room left for the focused panel grows with the
+	// panel count. Keep the historical floor of 9 for the default five panels.
+	minimumHeight := max(9, sideWindowCount+4)
+
+	// A menu popup gets three quarters of the screen, of which its frame, the
+	// tooltip gap below it and a reserved filter row take seven rows, so below 11
+	// rows there is no room left for even one menu item.
+	if menuWithFilterRowVisible {
+		minimumHeight = max(minimumHeight, 11)
+	}
+
+	return minimumHeight
 }
 
 func (gui *Gui) prepareView(viewName string) (*gocui.View, error) {
@@ -301,7 +266,9 @@ func (gui *Gui) prepareView(viewName string) (*gocui.View, error) {
 }
 
 func (gui *Gui) onInitialViewsCreationForRepo() error {
-	gui.setInitialViewContexts()
+	if err := gui.onRepoViewReset(); err != nil {
+		return err
+	}
 
 	// hide any popup views. This only applies when we've just switched repos
 	for _, viewName := range gui.popupViewNames() {
@@ -311,88 +278,66 @@ func (gui *Gui) onInitialViewsCreationForRepo() error {
 		}
 	}
 
-	initialContext := gui.currentSideContext()
-	if err := gui.pushContext(initialContext); err != nil {
-		return err
-	}
+	initialContext := gui.c.Context().Current()
+	gui.c.Context().Activate(initialContext, types.OnFocusOpts{})
 
 	return gui.loadNewRepo()
 }
 
-func (gui *Gui) onInitialViewsCreation() error {
+func (gui *Gui) popupViewNames() []string {
+	popups := lo.Filter(gui.State.Contexts.Flatten(), func(c types.Context, _ int) bool {
+		return c.GetKind() == types.PERSISTENT_POPUP || c.GetKind() == types.TEMPORARY_POPUP
+	})
+
+	return lo.Map(popups, func(c types.Context, _ int) string {
+		return c.GetViewName()
+	})
+}
+
+func (gui *Gui) onRepoViewReset() error {
 	// now we order the views (in order of bottom first)
-	layerOneViews := []*gocui.View{
-		// first layer. Ordering within this layer does not matter because there are
-		// no overlapping views
-		gui.Views.Status,
-		gui.Views.Files,
-		gui.Views.Branches,
-		gui.Views.Commits,
-		gui.Views.Stash,
-		gui.Views.CommitFiles,
-		gui.Views.Main,
-		gui.Views.Secondary,
-		gui.Views.Extras,
-
-		// bottom line
-		gui.Views.Options,
-		gui.Views.AppStatus,
-		gui.Views.Information,
-		gui.Views.Search,
-		gui.Views.SearchPrefix, // this view takes up one character. Its only purpose is to show the slash when searching
-
-		// popups. Ordering within this layer does not matter because there should
-		// only be one popup shown at a time
-		gui.Views.CommitMessage,
-		gui.Views.Menu,
-		gui.Views.Suggestions,
-		gui.Views.Confirmation,
-		gui.Views.Credentials,
-
-		// this guy will cover everything else when it appears
-		gui.Views.Limit,
-	}
-
-	for _, view := range layerOneViews {
+	for _, view := range gui.orderedViews() {
 		if _, err := gui.g.SetViewOnTop(view.Name()); err != nil {
 			return err
 		}
 	}
 
-	gui.g.Mutexes.ViewsMutex.Lock()
-	// add tabs to views
-	for _, view := range gui.g.Views() {
-		tabs := gui.viewTabNames(view.Name())
-		if len(tabs) == 0 {
-			continue
-		}
-		view.Tabs = tabs
-	}
-	gui.g.Mutexes.ViewsMutex.Unlock()
+	// The loop above orders views by a fixed list, which doesn't necessarily put
+	// each panel's first configured tab on top.
+	gui.moveDefaultTabsToTop()
 
-	if err := gui.keybindings(); err != nil {
-		return err
-	}
+	return nil
+}
 
-	if !gui.UserConfig.DisableStartupPopups {
-		popupTasks := []func(chan struct{}) error{}
-		storedPopupVersion := gui.Config.GetAppState().StartupPopupVersion
+func (gui *Gui) onInitialViewsCreation() error {
+	if !gui.c.UserConfig().DisableStartupPopups {
+		storedPopupVersion := gui.c.GetAppState().StartupPopupVersion
 		if storedPopupVersion < StartupPopupVersion {
-			popupTasks = append(popupTasks, gui.showIntroPopupMessage)
+			gui.showIntroPopupMessage()
+		} else {
+			gui.showBreakingChangesMessage()
 		}
-		gui.showInitialPopups(popupTasks)
 	}
+
+	gui.c.GetAppState().LastVersion = gui.Config.GetVersion()
+	gui.c.SaveAppStateAndLogError()
 
 	if gui.showRecentRepos {
-		if err := gui.handleCreateRecentReposMenu(); err != nil {
+		if err := gui.helpers.Repos.CreateRecentReposMenu(); err != nil {
 			return err
 		}
 		gui.showRecentRepos = false
 	}
 
-	gui.Updater.CheckForNewUpdate(gui.onBackgroundUpdateCheckFinish, false)
+	gui.helpers.Update.CheckForUpdateInBackground()
 
 	gui.waitForIntro.Done()
 
 	return nil
+}
+
+func (gui *Gui) transientContexts() []types.Context {
+	return lo.Filter(gui.State.Contexts.Flatten(), func(context types.Context, _ int) bool {
+		return context.IsTransient()
+	})
 }

@@ -1,550 +1,401 @@
 package gui
 
 import (
-	"errors"
-	"fmt"
+	"sync"
 
-	"github.com/jesseduffield/gocui"
+	"github.com/jesseduffield/generics/set"
+	"github.com/jesseduffield/lazygit/pkg/gui/context"
+	"github.com/jesseduffield/lazygit/pkg/gui/types"
+	"github.com/jesseduffield/lazygit/pkg/utils"
+	"github.com/samber/lo"
 )
 
-type ContextKind int
+// This file is for the management of contexts. There is a context stack such that
+// for example you might start off in the commits context and then open a menu, putting
+// you in the menu context. When contexts are activated/deactivated certain things need
+// to happen like showing/hiding views and rendering content.
 
-const (
-	SIDE_CONTEXT ContextKind = iota
-	MAIN_CONTEXT
-	TEMPORARY_POPUP
-	PERSISTENT_POPUP
-	EXTRAS_CONTEXT
-)
+type ContextMgr struct {
+	ContextStack []types.Context
+	sync.RWMutex
+	gui *Gui
 
-type OnFocusOpts struct {
-	ClickedViewName    string
-	ClickedViewLineIdx int
+	allContexts *context.ContextTree
 }
 
-type Context interface {
-	HandleFocus(opts ...OnFocusOpts) error
-	HandleFocusLost() error
-	HandleRender() error
-	HandleRenderToMain() error
-	GetKind() ContextKind
-	GetViewName() string
-	GetWindowName() string
-	SetWindowName(string)
-	GetKey() ContextKey
-	SetParentContext(Context)
-
-	// we return a bool here to tell us whether or not the returned value just wraps a nil
-	GetParentContext() (Context, bool)
-	GetOptionsMap() map[string]string
-}
-
-func (gui *Gui) popupViewNames() []string {
-	result := []string{}
-	for _, context := range gui.allContexts() {
-		if context.GetKind() == PERSISTENT_POPUP || context.GetKind() == TEMPORARY_POPUP {
-			result = append(result, context.GetViewName())
-		}
+func NewContextMgr(
+	gui *Gui,
+	allContexts *context.ContextTree,
+) *ContextMgr {
+	return &ContextMgr{
+		ContextStack: []types.Context{},
+		RWMutex:      sync.RWMutex{},
+		gui:          gui,
+		allContexts:  allContexts,
 	}
-
-	return result
 }
 
-func (gui *Gui) currentContextKeyIgnoringPopups() ContextKey {
-	gui.State.ContextManager.RLock()
-	defer gui.State.ContextManager.RUnlock()
-
-	stack := gui.State.ContextManager.ContextStack
-
-	for i := range stack {
-		reversedIndex := len(stack) - 1 - i
-		context := stack[reversedIndex]
-		kind := stack[reversedIndex].GetKind()
-		if kind != TEMPORARY_POPUP && kind != PERSISTENT_POPUP {
-			return context.GetKey()
-		}
-	}
-
-	return ""
-}
-
-// use replaceContext when you don't want to return to the original context upon
+// use when you don't want to return to the original context upon
 // hitting escape: you want to go that context's parent instead.
-func (gui *Gui) replaceContext(c Context) error {
-	gui.g.Update(func(*gocui.Gui) error {
-		gui.State.ContextManager.Lock()
-		defer gui.State.ContextManager.Unlock()
-
-		if len(gui.State.ContextManager.ContextStack) == 0 {
-			gui.State.ContextManager.ContextStack = []Context{c}
-		} else {
-			// replace the last item with the given item
-			gui.State.ContextManager.ContextStack = append(gui.State.ContextManager.ContextStack[0:len(gui.State.ContextManager.ContextStack)-1], c)
-		}
-
-		return gui.activateContext(c)
-	})
-
-	return nil
-}
-
-func (gui *Gui) pushContext(c Context, opts ...OnFocusOpts) error {
-	// using triple dot but you should only ever pass one of these opt structs
-	if len(opts) > 1 {
-		return errors.New("cannot pass multiple opts to pushContext")
+func (self *ContextMgr) Replace(c types.Context) {
+	if !c.IsFocusable() {
+		return
 	}
 
-	gui.g.Update(func(*gocui.Gui) error {
-		return gui.pushContextDirect(c, opts...)
-	})
+	self.Lock()
 
-	return nil
+	if len(self.ContextStack) == 0 {
+		self.ContextStack = []types.Context{c}
+	} else {
+		// replace the last item with the given item
+		self.ContextStack = append(self.ContextStack[0:len(self.ContextStack)-1], c)
+	}
+
+	self.Unlock()
+
+	self.Activate(c, types.OnFocusOpts{})
 }
 
-func (gui *Gui) pushContextDirect(c Context, opts ...OnFocusOpts) error {
-	gui.State.ContextManager.Lock()
+func (self *ContextMgr) Push(c types.Context, opts types.OnFocusOpts) {
+	if !c.IsFocusable() {
+		return
+	}
 
-	// push onto stack
-	// if we are switching to a side context, remove all other contexts in the stack
-	if c.GetKind() == SIDE_CONTEXT {
-		for _, stackContext := range gui.State.ContextManager.ContextStack {
-			if stackContext.GetKey() != c.GetKey() {
-				if err := gui.deactivateContext(stackContext); err != nil {
-					gui.State.ContextManager.Unlock()
-					return err
-				}
+	contextsToDeactivate, contextToActivate := self.pushToContextStack(c)
+
+	for _, contextToDeactivate := range contextsToDeactivate {
+		self.deactivate(contextToDeactivate, types.OnFocusLostOpts{NewContextKey: c.GetKey()})
+	}
+
+	if contextToActivate != nil {
+		self.Activate(contextToActivate, opts)
+	}
+}
+
+// Adjusts the context stack based on the context that's being pushed and
+// returns (contexts to deactivate, context to activate)
+func (self *ContextMgr) pushToContextStack(c types.Context) ([]types.Context, types.Context) {
+	contextsToDeactivate := []types.Context{}
+
+	self.Lock()
+	defer self.Unlock()
+
+	if len(self.ContextStack) > 0 &&
+		c.GetKey() == self.ContextStack[len(self.ContextStack)-1].GetKey() {
+		// Context being pushed is already on top of the stack: nothing to
+		// deactivate or activate
+		return contextsToDeactivate, nil
+	}
+
+	if len(self.ContextStack) == 0 {
+		self.ContextStack = append(self.ContextStack, c)
+	} else if c.GetKind() == types.SIDE_CONTEXT {
+		// if we are switching to a side context, remove all other contexts in the stack
+		contextsToDeactivate = lo.Filter(self.ContextStack, func(context types.Context, _ int) bool {
+			return context.GetKey() != c.GetKey()
+		})
+		self.ContextStack = []types.Context{c}
+	} else if c.GetKind() == types.MAIN_CONTEXT {
+		// if we're switching to a main context, remove all other main contexts in the stack
+		contextsToKeep := []types.Context{}
+		for _, stackContext := range self.ContextStack {
+			if stackContext.GetKind() == types.MAIN_CONTEXT {
+				contextsToDeactivate = append(contextsToDeactivate, stackContext)
+			} else {
+				contextsToKeep = append(contextsToKeep, stackContext)
 			}
 		}
-		gui.State.ContextManager.ContextStack = []Context{c}
-	} else if len(gui.State.ContextManager.ContextStack) == 0 || gui.currentContextWithoutLock().GetKey() != c.GetKey() {
-		// Do not append if the one at the end is the same context (e.g. opening a menu from a menu)
-		// In that case we'll just close the menu entirely when the user hits escape.
+		self.ContextStack = append(contextsToKeep, c)
+	} else {
+		topContext := self.currentContextWithoutLock()
 
-		// TODO: think about other exceptional cases
-		gui.State.ContextManager.ContextStack = append(gui.State.ContextManager.ContextStack, c)
+		// if we're pushing the same context on, we do nothing.
+		if topContext.GetKey() != c.GetKey() {
+			// if top one is a temporary popup, we remove it. Ideally you'd be able to
+			// escape back to previous temporary popups, but because we're currently reusing
+			// views for this, you might not be able to get back to where you previously were.
+			// The exception is when going to the search context e.g. for searching a menu.
+			if (topContext.GetKind() == types.TEMPORARY_POPUP && c.GetKey() != context.SEARCH_CONTEXT_KEY) ||
+				// we only ever want one main context on the stack at a time.
+				(topContext.GetKind() == types.MAIN_CONTEXT && c.GetKind() == types.MAIN_CONTEXT) {
+
+				contextsToDeactivate = append(contextsToDeactivate, topContext)
+				_, self.ContextStack = utils.Pop(self.ContextStack)
+			}
+
+			self.ContextStack = append(self.ContextStack, c)
+		}
 	}
 
-	gui.State.ContextManager.Unlock()
-
-	return gui.activateContext(c, opts...)
+	return contextsToDeactivate, c
 }
 
-// asynchronous code idea: functions return an error via a channel, when done
+func (self *ContextMgr) Pop() {
+	self.Lock()
 
-// pushContextWithView is to be used when you don't know which context you
-// want to switch to: you only know the view that you want to switch to. It will
-// look up the context currently active for that view and switch to that context
-func (gui *Gui) pushContextWithView(viewName string) error {
-	return gui.pushContext(gui.State.ViewContextMap[viewName])
-}
-
-func (gui *Gui) returnFromContext() error {
-	gui.g.Update(func(*gocui.Gui) error {
-		return gui.returnFromContextSync()
-	})
-
-	return nil
-}
-
-func (gui *Gui) returnFromContextSync() error {
-	gui.State.ContextManager.Lock()
-
-	if len(gui.State.ContextManager.ContextStack) == 1 {
+	if len(self.ContextStack) == 1 {
 		// cannot escape from bottommost context
-		gui.State.ContextManager.Unlock()
-		return nil
+		self.Unlock()
+		return
 	}
 
-	n := len(gui.State.ContextManager.ContextStack) - 1
+	var currentContext types.Context
+	currentContext, self.ContextStack = utils.Pop(self.ContextStack)
 
-	currentContext := gui.State.ContextManager.ContextStack[n]
-	newContext := gui.State.ContextManager.ContextStack[n-1]
+	newContext := self.ContextStack[len(self.ContextStack)-1]
 
-	gui.State.ContextManager.ContextStack = gui.State.ContextManager.ContextStack[:n]
+	self.Unlock()
 
-	gui.State.ContextManager.Unlock()
+	self.deactivate(currentContext, types.OnFocusLostOpts{NewContextKey: newContext.GetKey()})
 
-	if err := gui.deactivateContext(currentContext); err != nil {
-		return err
-	}
-
-	return gui.activateContext(newContext)
+	self.Activate(newContext, types.OnFocusOpts{})
 }
 
-func (gui *Gui) deactivateContext(c Context) error {
-	view, _ := gui.g.View(c.GetViewName())
+func (self *ContextMgr) deactivate(c types.Context, opts types.OnFocusLostOpts) {
+	view, _ := self.gui.c.GocuiGui().View(c.GetViewName())
 
-	if view != nil && view.IsSearching() {
-		if err := gui.onSearchEscape(); err != nil {
-			return err
+	if opts.NewContextKey != context.SEARCH_CONTEXT_KEY {
+		if c.GetKind() == types.MAIN_CONTEXT || c.GetKind() == types.TEMPORARY_POPUP {
+			self.gui.helpers.Search.CancelSearchIfSearching(c)
 		}
 	}
 
 	// if we are the kind of context that is sent to back upon deactivation, we should do that
-	if view != nil && (c.GetKind() == TEMPORARY_POPUP || c.GetKind() == PERSISTENT_POPUP || c.GetKey() == COMMIT_FILES_CONTEXT_KEY) {
+	if view != nil &&
+		(c.GetKind() == types.TEMPORARY_POPUP ||
+			c.GetKind() == types.PERSISTENT_POPUP) {
 		view.Visible = false
 	}
 
-	if err := c.HandleFocusLost(); err != nil {
-		return err
-	}
-
-	return nil
+	c.HandleFocusLost(opts)
 }
 
-// postRefreshUpdate is to be called on a context after the state that it depends on has been refreshed
-// if the context's view is set to another context we do nothing.
-// if the context's view is the current view we trigger a focus; re-selecting the current item.
-func (gui *Gui) postRefreshUpdate(c Context) error {
-	v, err := gui.g.View(c.GetViewName())
-	if err != nil {
-		return nil
-	}
-
-	if ContextKey(v.Context) != c.GetKey() {
-		return nil
-	}
-
-	if err := c.HandleRender(); err != nil {
-		return err
-	}
-
-	if gui.currentViewName() == c.GetViewName() {
-		if err := c.HandleFocus(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (gui *Gui) activateContext(c Context, opts ...OnFocusOpts) error {
+func (self *ContextMgr) Activate(c types.Context, opts types.OnFocusOpts) {
 	viewName := c.GetViewName()
-	v, err := gui.g.View(viewName)
+	v, err := self.gui.c.GocuiGui().View(viewName)
 	if err != nil {
-		return err
-	}
-	originalViewContextKey := ContextKey(v.Context)
-
-	// ensure that any other window for which this view was active is now set to the default for that window.
-	gui.setViewAsActiveForWindow(v)
-
-	if viewName == "main" {
-		gui.changeMainViewsContext(c.GetKey())
-	} else {
-		gui.changeMainViewsContext(MAIN_NORMAL_CONTEXT_KEY)
+		panic(err)
 	}
 
-	gui.setViewTabForContext(c)
+	self.gui.helpers.Window.SetWindowContext(c)
 
-	if _, err := gui.g.SetCurrentView(viewName); err != nil {
-		return err
+	self.gui.helpers.Window.MoveToTopOfWindow(c)
+	inputViewName := c.GetInputViewName()
+	if _, err := self.gui.c.GocuiGui().SetCurrentView(inputViewName); err != nil {
+		panic(err)
+	}
+
+	self.gui.helpers.Search.RenderSearchStatus(c)
+
+	desiredTitle := c.Title()
+	if desiredTitle != "" {
+		v.Title = desiredTitle
 	}
 
 	v.Visible = true
 
-	// if the new context's view was previously displaying another context, render the new context
-	if originalViewContextKey != c.GetKey() {
-		if err := c.HandleRender(); err != nil {
-			return err
+	self.gui.c.GocuiGui().Cursor = v.Editable && v.Mask == ""
+
+	self.updateSelectionHighlights()
+
+	c.HandleFocus(opts)
+}
+
+// updateSelectionHighlights re-derives which views draw a selection, and which of
+// them draw theirs as the active one: a view shows a selection while its context is
+// on the stack and has something to select, and the context the user is in shows the
+// active selection while the ones behind it show inactive ones.
+//
+// Both of those can change, so this is called wherever they do: from Activate, which
+// every change to the stack goes through; after a refresh, since that is when the
+// contents of a list change; and from whoever tells a context that its content has
+// gained or lost something to select.
+func (self *ContextMgr) updateSelectionHighlights() {
+	self.RLock()
+	defer self.RUnlock()
+
+	onStack := set.NewFromSlice(lo.Map(self.ContextStack,
+		func(c types.Context, _ int) types.ContextKey { return c.GetKey() }))
+	currentKey := self.currentContextWithoutLock().GetKey()
+
+	for _, c := range self.allContexts.Flatten() {
+		// The global context has no view of its own.
+		if view := c.GetView(); view != nil {
+			view.Highlight = onStack.Includes(c.GetKey()) && c.HasSelectableContent()
+			view.HighlightInactive = c.GetKey() != currentKey
 		}
 	}
-
-	v.Context = string(c.GetKey())
-
-	gui.g.Cursor = v.Editable
-
-	// render the options available for the current context at the bottom of the screen
-	optionsMap := c.GetOptionsMap()
-	if optionsMap == nil {
-		optionsMap = gui.globalOptionsMap()
-	}
-	gui.renderOptionsMap(optionsMap)
-
-	if err := c.HandleFocus(opts...); err != nil {
-		return err
-	}
-
-	// TODO: consider removing this and instead depending on the .Context field of views
-	gui.State.ViewContextMap[c.GetViewName()] = c
-
-	return nil
 }
 
-// // currently unused
-// func (gui *Gui) renderContextStack() string {
-// 	result := ""
-// 	for _, context := range gui.State.ContextManager.ContextStack {
-// 		result += string(context.GetKey()) + "\n"
-// 	}
-// 	return result
-// }
+func (self *ContextMgr) Current() types.Context {
+	self.RLock()
+	defer self.RUnlock()
 
-func (gui *Gui) currentContext() Context {
-	gui.State.ContextManager.RLock()
-	defer gui.State.ContextManager.RUnlock()
-
-	return gui.currentContextWithoutLock()
+	return self.currentContextWithoutLock()
 }
 
-func (gui *Gui) currentContextWithoutLock() Context {
-	if len(gui.State.ContextManager.ContextStack) == 0 {
-		return gui.defaultSideContext()
+func (self *ContextMgr) currentContextWithoutLock() types.Context {
+	if len(self.ContextStack) == 0 {
+		return self.gui.defaultSideContext()
 	}
 
-	return gui.State.ContextManager.ContextStack[len(gui.State.ContextManager.ContextStack)-1]
+	return self.ContextStack[len(self.ContextStack)-1]
 }
 
-// the status panel is not yet a list context (and may never be), so this method is not
-// quite the same as currentSideContext()
-func (gui *Gui) currentSideListContext() IListContext {
-	context := gui.currentSideContext()
-	listContext, ok := context.(IListContext)
-	if !ok {
-		return nil
-	}
-	return listContext
-}
+// Note that this could return the 'status' context which is not itself a list context.
+func (self *ContextMgr) CurrentSide() types.Context {
+	self.RLock()
+	defer self.RUnlock()
 
-func (gui *Gui) currentSideContext() Context {
-	gui.State.ContextManager.RLock()
-	defer gui.State.ContextManager.RUnlock()
+	stack := self.ContextStack
 
-	stack := gui.State.ContextManager.ContextStack
-
-	// on startup the stack can be empty so we'll return an empty string in that case
-	if len(stack) == 0 {
-		return gui.defaultSideContext()
-	}
-
-	// find the first context in the stack with the type of SIDE_CONTEXT
+	// find the first context in the stack with the type of types.SIDE_CONTEXT
 	for i := range stack {
 		context := stack[len(stack)-1-i]
 
-		if context.GetKind() == SIDE_CONTEXT {
+		if context.GetKind() == types.SIDE_CONTEXT {
 			return context
 		}
 	}
 
-	return gui.defaultSideContext()
+	return self.gui.defaultSideContext()
 }
 
 // static as opposed to popup
-func (gui *Gui) currentStaticContext() Context {
-	gui.State.ContextManager.RLock()
-	defer gui.State.ContextManager.RUnlock()
+func (self *ContextMgr) CurrentStatic() types.Context {
+	self.RLock()
+	defer self.RUnlock()
 
-	stack := gui.State.ContextManager.ContextStack
+	return self.currentStaticContextWithoutLock()
+}
+
+func (self *ContextMgr) currentStaticContextWithoutLock() types.Context {
+	stack := self.ContextStack
 
 	if len(stack) == 0 {
-		return gui.defaultSideContext()
+		return self.gui.defaultSideContext()
 	}
 
 	// find the first context in the stack without a popup type
 	for i := range stack {
 		context := stack[len(stack)-1-i]
 
-		if context.GetKind() != TEMPORARY_POPUP && context.GetKind() != PERSISTENT_POPUP {
+		if context.GetKind() != types.TEMPORARY_POPUP && context.GetKind() != types.PERSISTENT_POPUP {
 			return context
 		}
 	}
 
-	return gui.defaultSideContext()
+	return self.gui.defaultSideContext()
 }
 
-func (gui *Gui) defaultSideContext() Context {
-	if gui.State.Modes.Filtering.Active() {
-		return gui.State.Contexts.BranchCommits
-	} else {
-		return gui.State.Contexts.Files
+func (self *ContextMgr) ForEach(f func(types.Context)) {
+	self.RLock()
+	defer self.RUnlock()
+
+	for _, context := range self.gui.State.ContextMgr.ContextStack {
+		f(context)
 	}
 }
 
-// remove the need to do this: always use a mapping
-func (gui *Gui) setInitialViewContexts() {
-	// arguably we should only have our ViewContextMap and we should do away with
-	// contexts on views, or vice versa
-	for viewName, context := range gui.State.ViewContextMap {
-		// see if the view exists. If it does, set the context on it
-		view, err := gui.g.View(viewName)
-		if err != nil {
-			continue
+func (self *ContextMgr) IsCurrent(c types.Context) bool {
+	return self.Current().GetKey() == c.GetKey()
+}
+
+func (self *ContextMgr) IsCurrentOrParent(c types.Context) bool {
+	current := self.Current()
+	for current != nil {
+		if current.GetKey() == c.GetKey() {
+			return true
 		}
-
-		view.Context = string(context.GetKey())
+		current = current.GetParentContext()
 	}
+
+	return false
 }
 
-// getFocusLayout returns a manager function for when view gain and lose focus
-func (gui *Gui) getFocusLayout() func(g *gocui.Gui) error {
-	var previousView *gocui.View
-	return func(g *gocui.Gui) error {
-		newView := gui.g.CurrentView()
-		if err := gui.onViewFocusChange(); err != nil {
-			return err
+func (self *ContextMgr) AllFilterable() []types.IFilterableContext {
+	var result []types.IFilterableContext
+
+	for _, context := range self.allContexts.Flatten() {
+		if ctx, ok := context.(types.IFilterableContext); ok {
+			result = append(result, ctx)
 		}
-		// for now we don't consider losing focus to a popup panel as actually losing focus
-		if newView != previousView && !gui.isPopupPanel(newView.Name()) {
-			if err := gui.onViewFocusLost(previousView, newView); err != nil {
-				return err
-			}
-
-			previousView = newView
-		}
-		return nil
-	}
-}
-
-func (gui *Gui) onViewFocusChange() error {
-	gui.g.Mutexes.ViewsMutex.Lock()
-	defer gui.g.Mutexes.ViewsMutex.Unlock()
-
-	currentView := gui.g.CurrentView()
-	for _, view := range gui.g.Views() {
-		view.Highlight = view.Name() != "main" && view.Name() != "extras" && view == currentView
-	}
-	return nil
-}
-
-func (gui *Gui) onViewFocusLost(oldView *gocui.View, newView *gocui.View) error {
-	if oldView == nil {
-		return nil
-	}
-
-	_ = oldView.SetOriginX(0)
-
-	if oldView == gui.Views.CommitFiles && newView != gui.Views.Main && newView != gui.Views.Secondary && newView != gui.Views.Search {
-		gui.resetWindowForView(gui.Views.CommitFiles)
-		if err := gui.deactivateContext(gui.State.Contexts.CommitFiles); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// changeContext is a helper function for when we want to change a 'main' context
-// which currently just means a context that affects both the main and secondary views
-// other views can have their context changed directly but this function helps
-// keep the main and secondary views in sync
-func (gui *Gui) changeMainViewsContext(contextKey ContextKey) {
-	if gui.State.MainContext == contextKey {
-		return
-	}
-
-	switch contextKey {
-	case MAIN_NORMAL_CONTEXT_KEY, MAIN_PATCH_BUILDING_CONTEXT_KEY, MAIN_STAGING_CONTEXT_KEY, MAIN_MERGING_CONTEXT_KEY:
-		gui.Views.Main.Context = string(contextKey)
-		gui.Views.Secondary.Context = string(contextKey)
-	default:
-		panic(fmt.Sprintf("unknown context for main: %s", contextKey))
-	}
-
-	gui.State.MainContext = contextKey
-}
-
-func (gui *Gui) viewTabNames(viewName string) []string {
-	tabContexts := gui.State.ViewTabContextMap[viewName]
-
-	if len(tabContexts) == 0 {
-		return nil
-	}
-
-	result := make([]string, len(tabContexts))
-	for i, tabContext := range tabContexts {
-		result[i] = tabContext.tab
 	}
 
 	return result
 }
 
-func (gui *Gui) setViewTabForContext(c Context) {
-	// search for the context in our map and if we find it, set the tab for the corresponding view
-	tabContexts, ok := gui.State.ViewTabContextMap[c.GetViewName()]
-	if !ok {
-		return
+func (self *ContextMgr) AllSearchable() []types.ISearchableContext {
+	var result []types.ISearchableContext
+
+	for _, context := range self.allContexts.Flatten() {
+		if ctx, ok := context.(types.ISearchableContext); ok {
+			result = append(result, ctx)
+		}
 	}
 
-	for tabIndex, tabContext := range tabContexts {
-		for _, context := range tabContext.contexts {
-			if context.GetKey() == c.GetKey() {
-				// get the view, set the tab
-				v, err := gui.g.View(c.GetViewName())
-				if err != nil {
-					gui.Log.Error(err)
-					return
-				}
-				v.TabIndex = tabIndex
-				return
+	return result
+}
+
+// all list contexts
+func (self *ContextMgr) AllList() []types.IListContext {
+	var listContexts []types.IListContext
+
+	for _, context := range self.allContexts.Flatten() {
+		if listContext, ok := context.(types.IListContext); ok {
+			listContexts = append(listContexts, listContext)
+		}
+	}
+
+	return listContexts
+}
+
+func (self *ContextMgr) AllPatchExplorer() []types.IPatchExplorerContext {
+	var listContexts []types.IPatchExplorerContext
+
+	for _, context := range self.allContexts.Flatten() {
+		if listContext, ok := context.(types.IPatchExplorerContext); ok {
+			listContexts = append(listContexts, listContext)
+		}
+	}
+
+	return listContexts
+}
+
+func (self *ContextMgr) ContextForKey(key types.ContextKey) types.Context {
+	self.RLock()
+	defer self.RUnlock()
+
+	for _, context := range self.allContexts.Flatten() {
+		if context.GetKey() == key {
+			return context
+		}
+	}
+
+	return nil
+}
+
+func (self *ContextMgr) CurrentPopup() []types.Context {
+	self.RLock()
+	defer self.RUnlock()
+
+	return lo.Filter(self.ContextStack, func(context types.Context, _ int) bool {
+		return context.GetKind() == types.TEMPORARY_POPUP || context.GetKind() == types.PERSISTENT_POPUP
+	})
+}
+
+func (self *ContextMgr) NextInStack(c types.Context) types.Context {
+	self.RLock()
+	defer self.RUnlock()
+
+	for i := range self.ContextStack {
+		if self.ContextStack[i].GetKey() == c.GetKey() {
+			if i == 0 {
+				return nil
 			}
-		}
-	}
-}
-
-type tabContext struct {
-	tab      string
-	contexts []Context
-}
-
-func (gui *Gui) mustContextForContextKey(contextKey ContextKey) Context {
-	context, ok := gui.contextForContextKey(contextKey)
-
-	if !ok {
-		panic(fmt.Sprintf("context not found for key %s", contextKey))
-	}
-
-	return context
-}
-
-func (gui *Gui) contextForContextKey(contextKey ContextKey) (Context, bool) {
-	for _, context := range gui.allContexts() {
-		if context.GetKey() == contextKey {
-			return context, true
+			return self.ContextStack[i-1]
 		}
 	}
 
-	return nil, false
+	panic("context not in stack")
 }
-
-func (gui *Gui) rerenderView(view *gocui.View) error {
-	contextKey := ContextKey(view.Context)
-	context := gui.mustContextForContextKey(contextKey)
-
-	return context.HandleRender()
-}
-
-func (gui *Gui) getSideContextSelectedItemId() string {
-	currentSideContext := gui.currentSideListContext()
-	if currentSideContext == nil {
-		return ""
-	}
-
-	item, ok := currentSideContext.GetSelectedItem()
-
-	if ok {
-		return item.ID()
-	}
-
-	return ""
-}
-
-// currently unused
-// func (gui *Gui) getCurrentSideView() *gocui.View {
-// 	currentSideContext := gui.currentSideContext()
-// 	if currentSideContext == nil {
-// 		return nil
-// 	}
-
-// 	view, _ := gui.g.View(currentSideContext.GetViewName())
-
-// 	return view
-// }
-
-// currently unused
-// func (gui *Gui) renderContextStack() string {
-// 	result := ""
-// 	for _, context := range gui.State.ContextManager.ContextStack {
-// 		result += context.GetViewName() + "\n"
-// 	}
-// 	return result
-// }

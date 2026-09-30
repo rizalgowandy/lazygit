@@ -36,8 +36,8 @@ type TextStyle struct {
 }
 
 type Sprinter interface {
-	Sprint(a ...interface{}) string
-	Sprintf(format string, a ...interface{}) string
+	Sprint(a ...any) string
+	Sprintf(format string, a ...any) string
 }
 
 func New() TextStyle {
@@ -46,11 +46,11 @@ func New() TextStyle {
 	return s
 }
 
-func (b TextStyle) Sprint(a ...interface{}) string {
+func (b TextStyle) Sprint(a ...any) string {
 	return b.Style.Sprint(a...)
 }
 
-func (b TextStyle) Sprintf(format string, a ...interface{}) string {
+func (b TextStyle) Sprintf(format string, a ...any) string {
 	return b.Style.Sprintf(format, a...)
 }
 
@@ -63,6 +63,12 @@ func (b TextStyle) SetBold() TextStyle {
 	return b
 }
 
+func (b TextStyle) SetDim() TextStyle {
+	b.decoration.SetDim()
+	b.Style = b.deriveStyle()
+	return b
+}
+
 func (b TextStyle) SetUnderline() TextStyle {
 	b.decoration.SetUnderline()
 	b.Style = b.deriveStyle()
@@ -71,6 +77,12 @@ func (b TextStyle) SetUnderline() TextStyle {
 
 func (b TextStyle) SetReverse() TextStyle {
 	b.decoration.SetReverse()
+	b.Style = b.deriveStyle()
+	return b
+}
+
+func (b TextStyle) SetStrikethrough() TextStyle {
+	b.decoration.SetStrikethrough()
 	b.Style = b.deriveStyle()
 	return b
 }

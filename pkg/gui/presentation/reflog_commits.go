@@ -1,66 +1,99 @@
 package presentation
 
 import (
+	"time"
+
+	"github.com/jesseduffield/generics/set"
 	"github.com/jesseduffield/lazygit/pkg/commands/models"
 	"github.com/jesseduffield/lazygit/pkg/gui/style"
 	"github.com/jesseduffield/lazygit/pkg/theme"
 	"github.com/jesseduffield/lazygit/pkg/utils"
 	"github.com/kyokomi/emoji/v2"
+	"github.com/samber/lo"
 )
 
-func GetReflogCommitListDisplayStrings(commits []*models.Commit, fullDescription bool, cherryPickedCommitShaMap map[string]bool, diffName string, parseEmoji bool) [][]string {
-	lines := make([][]string, len(commits))
+func GetReflogCommitListDisplayStrings(commits []*models.Commit, startIdx int, endIdx int, fullDescription bool, cherryPickedCommitHashSet *set.Set[string], diffName string, now time.Time, timeFormat string, shortTimeFormat string, parseEmoji bool) [][]string {
+	if startIdx >= len(commits) {
+		return nil
+	}
 
-	var displayFunc func(*models.Commit, map[string]bool, bool, bool) []string
+	var displayFunc func(*models.Commit, reflogCommitDisplayAttributes) []string
+	reservedDateWidth := 0
 	if fullDescription {
 		displayFunc = getFullDescriptionDisplayStringsForReflogCommit
+		// See getReservedColumnWidths for why the oldest entry alone decides
+		// how much width the date column needs.
+		reservedDateWidth = utils.StringWidth(utils.UnixToDateSmart(
+			now, commits[len(commits)-1].UnixTimestamp, timeFormat, shortTimeFormat))
 	} else {
 		displayFunc = getDisplayStringsForReflogCommit
 	}
 
-	for i := range commits {
-		diffed := commits[i].Sha == diffName
-		lines[i] = displayFunc(commits[i], cherryPickedCommitShaMap, diffed, parseEmoji)
-	}
-
-	return lines
+	return lo.Map(commits[startIdx:endIdx], func(commit *models.Commit, _ int) []string {
+		diffed := commit.Hash() == diffName
+		cherryPicked := cherryPickedCommitHashSet.Includes(commit.Hash())
+		return displayFunc(commit,
+			reflogCommitDisplayAttributes{
+				cherryPicked:      cherryPicked,
+				diffed:            diffed,
+				parseEmoji:        parseEmoji,
+				timeFormat:        timeFormat,
+				shortTimeFormat:   shortTimeFormat,
+				now:               now,
+				reservedDateWidth: reservedDateWidth,
+			})
+	})
 }
 
-func coloredReflogSha(c *models.Commit, cherryPickedCommitShaMap map[string]bool) string {
-	shaColor := style.FgBlue
-	if cherryPickedCommitShaMap[c.Sha] {
-		shaColor = theme.CherryPickedCommitTextStyle
-	}
-
-	return shaColor.Sprint(c.ShortSha())
-}
-
-func getFullDescriptionDisplayStringsForReflogCommit(c *models.Commit, cherryPickedCommitShaMap map[string]bool, diffed, parseEmoji bool) []string {
-	colorAttr := theme.DefaultTextColor
+func reflogHashColor(cherryPicked, diffed bool) style.TextStyle {
 	if diffed {
-		colorAttr = theme.DiffTerminalColor
+		return theme.DiffTerminalColor
 	}
 
+	hashColor := style.FgBlue
+	if cherryPicked {
+		hashColor = theme.CherryPickedCommitTextStyle
+	}
+
+	return hashColor
+}
+
+type reflogCommitDisplayAttributes struct {
+	cherryPicked    bool
+	diffed          bool
+	parseEmoji      bool
+	timeFormat      string
+	shortTimeFormat string
+	now             time.Time
+	// The width the date column needs for the whole reflog, not just for the
+	// lines that are on screen
+	reservedDateWidth int
+}
+
+func getFullDescriptionDisplayStringsForReflogCommit(c *models.Commit, attrs reflogCommitDisplayAttributes) []string {
 	name := c.Name
-	if parseEmoji {
+	if attrs.parseEmoji {
 		name = emoji.Sprint(name)
 	}
 
+	date := style.FgMagenta.Sprint(
+		utils.UnixToDateSmart(attrs.now, c.UnixTimestamp, attrs.timeFormat, attrs.shortTimeFormat))
+
 	return []string{
-		coloredReflogSha(c, cherryPickedCommitShaMap),
-		style.FgMagenta.Sprint(utils.UnixToDate(c.UnixTimestamp)),
-		colorAttr.Sprint(name),
+		reflogHashColor(attrs.cherryPicked, attrs.diffed).Sprint(c.ShortHash()),
+		utils.WithPadding(date, attrs.reservedDateWidth, utils.AlignLeft),
+		theme.DefaultTextColor.Sprint(name),
 	}
 }
 
-func getDisplayStringsForReflogCommit(c *models.Commit, cherryPickedCommitShaMap map[string]bool, diffed, parseEmoji bool) []string {
+func getDisplayStringsForReflogCommit(c *models.Commit, attrs reflogCommitDisplayAttributes) []string {
 	name := c.Name
-	if parseEmoji {
+	if attrs.parseEmoji {
 		name = emoji.Sprint(name)
 	}
 
 	return []string{
-		coloredReflogSha(c, cherryPickedCommitShaMap),
+		reflogHashColor(attrs.cherryPicked, attrs.diffed).Sprint(c.ShortHash()),
 		theme.DefaultTextColor.Sprint(name),
 	}
 }

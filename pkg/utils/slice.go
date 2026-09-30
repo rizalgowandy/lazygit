@@ -1,28 +1,6 @@
 package utils
 
-// IncludesString if the list contains the string
-func IncludesString(list []string, a string) bool {
-	return IncludesStringFunc(list, func(b string) bool { return b == a })
-}
-
-func IncludesStringFunc(list []string, fn func(string) bool) bool {
-	for _, b := range list {
-		if fn(b) {
-			return true
-		}
-	}
-	return false
-}
-
-// IncludesInt if the list contains the Int
-func IncludesInt(list []int, a int) bool {
-	for _, b := range list {
-		if b == a {
-			return true
-		}
-	}
-	return false
-}
+import "golang.org/x/exp/slices"
 
 // NextIndex returns the index of the element that comes after the given number
 func NextIndex(numbers []int, currentNumber int) int {
@@ -43,44 +21,6 @@ func PrevIndex(numbers []int, currentNumber int) int {
 		}
 	}
 	return 0
-}
-
-// UnionInt returns the union of two int arrays
-func UnionInt(a, b []int) []int {
-	m := make(map[int]bool)
-
-	for _, item := range a {
-		m[item] = true
-	}
-
-	for _, item := range b {
-		if _, ok := m[item]; !ok {
-			// this does not mutate the original a slice
-			// though it does mutate the backing array I believe
-			// but that doesn't matter because if you later want to append to the
-			// original a it must see that the backing array has been changed
-			// and create a new one
-			a = append(a, item)
-		}
-	}
-	return a
-}
-
-// DifferenceInt returns the difference of two int arrays
-func DifferenceInt(a, b []int) []int {
-	result := []int{}
-	m := make(map[int]bool)
-
-	for _, item := range b {
-		m[item] = true
-	}
-
-	for _, item := range a {
-		if _, ok := m[item]; !ok {
-			result = append(result, item)
-		}
-	}
-	return result
 }
 
 // NextIntInCycle returns the next int in a slice, returning to the first index if we've reached the end
@@ -111,27 +51,12 @@ func PrevIntInCycle(sl []int, current int) int {
 
 func StringArraysOverlap(strArrA []string, strArrB []string) bool {
 	for _, first := range strArrA {
-		for _, second := range strArrB {
-			if first == second {
-				return true
-			}
+		if slices.Contains(strArrB, first) {
+			return true
 		}
 	}
 
 	return false
-}
-
-func Uniq(values []string) []string {
-	added := make(map[string]bool)
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if added[value] {
-			continue
-		}
-		added[value] = true
-		result = append(result, value)
-	}
-	return result
 }
 
 func Limit(values []string, limit int) []string {
@@ -139,14 +64,6 @@ func Limit(values []string, limit int) []string {
 		return values[:limit]
 	}
 	return values
-}
-
-func Reverse(values []string) []string {
-	result := make([]string, len(values))
-	for i, val := range values {
-		result[len(values)-i-1] = val
-	}
-	return result
 }
 
 func LimitStr(value string, limit int) string {
@@ -158,4 +75,105 @@ func LimitStr(value string, limit int) string {
 		n++
 	}
 	return value
+}
+
+// Similar to a regular GroupBy, except that each item can be grouped under multiple keys,
+// so the callback returns a slice of keys instead of just one key.
+func MuiltiGroupBy[T any, K comparable](slice []T, f func(T) []K) map[K][]T {
+	result := map[K][]T{}
+	for _, item := range slice {
+		for _, key := range f(item) {
+			if _, ok := result[key]; !ok {
+				result[key] = []T{item}
+			} else {
+				result[key] = append(result[key], item)
+			}
+		}
+	}
+	return result
+}
+
+// Returns a new slice with the element at index 'from' moved to index 'to'.
+// Does not mutate original slice.
+func MoveElement[T any](slice []T, from int, to int) []T {
+	newSlice := make([]T, len(slice))
+	copy(newSlice, slice)
+
+	if from == to {
+		return newSlice
+	}
+
+	if from < to {
+		copy(newSlice[from:to+1], newSlice[from+1:to+1])
+	} else {
+		copy(newSlice[to+1:from+1], newSlice[to:from])
+	}
+
+	newSlice[to] = slice[from]
+
+	return newSlice
+}
+
+func ValuesAtIndices[T any](slice []T, indices []int) []T {
+	result := make([]T, len(indices))
+	for i, index := range indices {
+		// gracefully handling the situation where the index is out of bounds
+		if index < len(slice) {
+			result[i] = slice[index]
+		}
+	}
+	return result
+}
+
+// returns two slices: the first is for elements that pass the test, the second for those that don't.
+func Partition[T any](slice []T, test func(T) bool) ([]T, []T) {
+	left := make([]T, 0, len(slice))
+	right := make([]T, 0, len(slice))
+
+	for _, value := range slice {
+		if test(value) {
+			left = append(left, value)
+		} else {
+			right = append(right, value)
+		}
+	}
+
+	return left, right
+}
+
+// Prepends items to the beginning of a slice.
+// E.g. Prepend([]int{1,2}, 3, 4) = []int{3,4,1,2}
+// Mutates original slice. Intended usage is to reassign the slice result to the input slice.
+func Prepend[T any](slice []T, values ...T) []T {
+	return append(values, slice...)
+}
+
+// Removes the element at the given index. Intended usage is to reassign the result to the input slice.
+func Remove[T any](slice []T, index int) []T {
+	return slices.Delete(slice, index, index+1)
+}
+
+// Removes the element at the 'fromIndex' and then inserts it at 'toIndex'.
+// Operates on the input slice. Expected use is to reassign the result to the input slice.
+func Move[T any](slice []T, fromIndex int, toIndex int) []T {
+	item := slice[fromIndex]
+	slice = Remove(slice, fromIndex)
+	return slices.Insert(slice, toIndex, item)
+}
+
+// Pops item from the end of the slice and returns it, along with the updated slice
+// Mutates original slice. Intended usage is to reassign the slice result to the input slice.
+func Pop[T any](slice []T) (T, []T) {
+	index := len(slice) - 1
+	value := slice[index]
+	slice = slice[0:index]
+	return value, slice
+}
+
+// Shifts item from the beginning of the slice and returns it, along with the updated slice.
+// Mutates original slice. Intended usage is to reassign the slice result to the input slice.
+func Shift[T any](slice []T) (T, []T) {
+	value := slice[0]
+	slice = slice[1:]
+	return value, slice
 }

@@ -3,26 +3,15 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/jesseduffield/gocui"
+	"github.com/jesseduffield/lazygit/pkg/gocui"
 )
-
-// GetCurrentRepoName gets the repo's base name
-func GetCurrentRepoName() string {
-	pwd, err := os.Getwd()
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
-	return filepath.Base(pwd)
-}
 
 // GetProjectRoot returns the path to the root of the project. Only to be used
 // in testing contexts, as with binaries it's unlikely this path will exist on
@@ -35,44 +24,30 @@ func GetProjectRoot() string {
 	return strings.Split(dir, "lazygit")[0] + "lazygit"
 }
 
-// Loader dumps a string to be displayed as a loader
-func Loader() string {
-	characters := "|/-\\"
-	now := time.Now()
-	nanos := now.UnixNano()
-	index := nanos / 50000000 % int64(len(characters))
-	return characters[index : index+1]
-}
-
-// Min returns the minimum of two integers
-func Min(x, y int) int {
+func SortRange(x int, y int) (int, int) {
 	if x < y {
-		return x
+		return x, y
 	}
-	return y
+	return y, x
 }
 
-func Max(x, y int) int {
-	if x > y {
-		return x
-	}
-	return y
-}
-
-func AsJson(i interface{}) string {
+func AsJson(i any) string {
 	bytes, _ := json.MarshalIndent(i, "", "    ")
 	return string(bytes)
 }
 
 // used to keep a number n between 0 and max, allowing for wraparounds
 func ModuloWithWrap(n, max int) int {
+	if max == 0 {
+		return 0
+	}
+
 	if n >= max {
 		return n % max
 	} else if n < 0 {
 		return max + n
-	} else {
-		return n
 	}
+	return n
 }
 
 func FindStringSubmatch(str string, regexpStr string) (bool, []string) {
@@ -114,4 +89,55 @@ func StackTrace() string {
 	buf := make([]byte, 10000)
 	n := runtime.Stack(buf, false)
 	return fmt.Sprintf("%s\n", buf[:n])
+}
+
+// returns the path of the file that calls the function.
+// 'skip' is the number of stack frames to skip.
+func FilePath(skip int) string {
+	_, path, _, _ := runtime.Caller(skip)
+	return path
+}
+
+// ExpandTilde expands a leading "~" that refers to the current user's home
+// directory: "~" and "~/foo" become e.g. "/home/user" and "/home/user/foo". A
+// tilde anywhere other than the start, or one immediately followed by a
+// username ("~other/foo"), is left untouched, as is the path if the home
+// directory can't be determined. We expand it ourselves because lazygit runs
+// git directly, with no shell to do it for us.
+func ExpandTilde(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") &&
+		!(runtime.GOOS == "windows" && strings.HasPrefix(path, `~\`)) {
+		return path
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
+}
+
+// ContractTilde is the inverse of ExpandTilde: it replaces the current user's
+// home directory at the start of a path with "~", so that paths can be shown
+// in a shorter form. Paths outside the home directory are left untouched, as
+// is the path if the home directory can't be determined.
+func ContractTilde(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+
+	if path == home {
+		return "~"
+	}
+
+	if rest, found := strings.CutPrefix(path, home+string(filepath.Separator)); found {
+		return "~" + string(filepath.Separator) + rest
+	}
+
+	return path
 }

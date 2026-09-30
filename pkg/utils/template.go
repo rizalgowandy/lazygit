@@ -6,8 +6,8 @@ import (
 	"text/template"
 )
 
-func ResolveTemplate(templateStr string, object interface{}) (string, error) {
-	tmpl, err := template.New("template").Parse(templateStr)
+func ResolveTemplate(templateStr string, object any, funcs template.FuncMap) (string, error) {
+	tmpl, err := template.New("template").Funcs(funcs).Option("missingkey=error").Parse(templateStr)
 	if err != nil {
 		return "", err
 	}
@@ -22,9 +22,12 @@ func ResolveTemplate(templateStr string, object interface{}) (string, error) {
 
 // ResolvePlaceholderString populates a template with values
 func ResolvePlaceholderString(str string, arguments map[string]string) string {
+	oldnews := make([]string, 0, len(arguments)*4)
 	for key, value := range arguments {
-		str = strings.Replace(str, "{{"+key+"}}", value, -1)
-		str = strings.Replace(str, "{{."+key+"}}", value, -1)
+		oldnews = append(oldnews,
+			"{{"+key+"}}", value,
+			"{{."+key+"}}", value,
+		)
 	}
-	return str
+	return strings.NewReplacer(oldnews...).Replace(str)
 }

@@ -10,11 +10,6 @@ import (
 	"github.com/xo/terminfo"
 )
 
-func init() {
-	// on CI we've got no color capability so we're forcing it here
-	color.ForceSetColorLevel(terminfo.ColorLevelMillions)
-}
-
 func TestMerge(t *testing.T) {
 	type scenario struct {
 		name          string
@@ -72,6 +67,25 @@ func TestMerge(t *testing.T) {
 				Style:      color.Style{color.OpBold},
 			},
 			"\x1b[1mfoo\x1b[0m",
+		},
+		{
+			"dim attribute",
+			[]TextStyle{AttrDim},
+			TextStyle{
+				decoration: Decoration{dim: true},
+				Style:      color.Style{color.OpFuzzy},
+			},
+			"\x1b[2mfoo\x1b[0m",
+		},
+		{
+			"dim attribute and color",
+			[]TextStyle{FgRed.SetDim()},
+			TextStyle{
+				fg:         &Color{basic: &fgRed},
+				decoration: Decoration{dim: true},
+				Style:      color.Style{fgRed, color.OpFuzzy},
+			},
+			"\x1b[31;2mfoo\x1b[0m",
 		},
 		{
 			"multiple attributes",
@@ -135,7 +149,7 @@ func TestMerge(t *testing.T) {
 			"\x1b[38;2;255;0;255;48;2;255;255;0;1;4mfoo\x1b[0m",
 		},
 		{
-			"mix color-16 with rgb colors",
+			"mix color-16 (background) with rgb (foreground)",
 			[]TextStyle{New().SetFg(rgbYellow), BgRed},
 			TextStyle{
 				fg: &rgbYellow,
@@ -147,10 +161,25 @@ func TestMerge(t *testing.T) {
 			},
 			"\x1b[38;2;255;255;0;48;2;197;30;20mfoo\x1b[0m",
 		},
+		{
+			"mix color-16 (foreground) with rgb (background)",
+			[]TextStyle{FgRed, New().SetBg(rgbYellow)},
+			TextStyle{
+				fg: &Color{basic: &fgRed},
+				bg: &rgbYellow,
+				Style: color.NewRGBStyle(
+					fgRed.RGB(),
+					rgbYellowLib,
+				).SetOpts(color.Opts{}),
+			},
+			"\x1b[38;2;197;30;20;48;2;255;255;0mfoo\x1b[0m",
+		},
 	}
 
+	oldColorLevel := color.ForceSetColorLevel(terminfo.ColorLevelMillions)
+	defer color.ForceSetColorLevel(oldColorLevel)
+
 	for _, s := range scenarios {
-		s := s
 		t.Run(s.name, func(t *testing.T) {
 			style := New()
 			for _, other := range s.toMerge {
@@ -197,8 +226,10 @@ func TestTemplateFuncMapAddColors(t *testing.T) {
 		},
 	}
 
+	oldColorLevel := color.ForceSetColorLevel(terminfo.ColorLevelMillions)
+	defer color.ForceSetColorLevel(oldColorLevel)
+
 	for _, s := range scenarios {
-		s := s
 		t.Run(s.name, func(t *testing.T) {
 			tmpl, err := template.New("test template").Funcs(TemplateFuncMapAddColors(template.FuncMap{})).Parse(s.tmpl)
 			assert.NoError(t, err)

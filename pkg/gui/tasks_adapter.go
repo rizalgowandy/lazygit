@@ -5,41 +5,79 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/jesseduffield/gocui"
+	"github.com/jesseduffield/lazygit/pkg/gocui"
 	"github.com/jesseduffield/lazygit/pkg/tasks"
+	"github.com/sirupsen/logrus"
 )
 
 func (gui *Gui) newCmdTask(view *gocui.View, cmd *exec.Cmd, prefix string) error {
 	cmdStr := strings.Join(cmd.Args, " ")
-	gui.Log.WithField(
+	gui.c.Log.WithField(
 		"command",
 		cmdStr,
 	).Debug("RunCommand")
 
-	_, height := view.Size()
-	_, oy := view.Origin()
+	// Mark the view as loading synchronously (before the task's goroutine runs
+	// and before the next layout pass) so the layout doesn't clamp the scroll
+	// position to the not-yet-loaded content.
+	gui.getManager(view).StartLoading()
+	// Hold the scrollbar at the height the view has now (the previous render),
+	// while it still shows that render: once the re-render swaps in its first
+	// partial paint the displayed buffer is briefly short, and we don't want the
+	// thumb to shrink and snap back as the rest loads.
+	view.FreezeScrollbarHeight()
 
-	manager := gui.getManager(view)
+	// Snapshot the view width here, on the UI thread, so the task goroutine
+	// doesn't read the view's live dimensions while it streams output.
+	spec := renderSpec{view: view, cmd: cmd, width: view.InnerWidth()}
 
-	start := func() (*exec.Cmd, io.Reader) {
-		r, err := cmd.StdoutPipe()
-		if err != nil {
-			gui.Log.Warn(err)
-		}
-		cmd.Stderr = cmd.Stdout
+	return gui.newTaskForRender(spec, prefix, cmdStr, gui.plainRender)
+}
 
-		if err := cmd.Start(); err != nil {
-			gui.Log.Warn(err)
-		}
+// plainRender runs the command as it is, with its output going straight into
+// a pipe.
+func (gui *Gui) plainRender(spec renderSpec) (startRender, onCloseRender) {
+	var r io.ReadCloser
+	start := func() (tasks.Cmd, io.Reader) {
+		// The view wraps to this width; apply it here, on the task's goroutine
+		// once the previous task has stopped, so it doesn't race that task's
+		// still-running writes (see View.SetContentWidth).
+		spec.view.SetContentWidth(spec.width)
 
-		return cmd, r
+		execCmd, pipe := startCmdWithPipe(spec.cmd, gui.c.Log)
+		r = pipe
+		return execCmd, pipe
 	}
 
-	if err := manager.NewTask(manager.NewCmdTask(start, prefix, height+oy+10, nil), cmdStr); err != nil {
-		gui.Log.Warn(err)
+	onClose := func() {
+		if r != nil {
+			r.Close()
+			r = nil
+		}
 	}
 
-	return nil
+	return start, onClose
+}
+
+// startCmdWithPipe starts cmd with its stdout and stderr going to a single
+// pipe, and returns the command along with the pipe's read end, in the shape
+// that NewCmdTask expects from its start func. It never returns a nil reader,
+// because NewCmdTask's scanner panics on one: when the pipe can't be created
+// the command isn't started at all, and an empty reader is returned so that
+// the task shuts down cleanly with the error in the log.
+func startCmdWithPipe(cmd *exec.Cmd, log *logrus.Entry) (tasks.Cmd, io.ReadCloser) {
+	r, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Error(err)
+		return tasks.ExecCmd{Cmd: cmd}, io.NopCloser(strings.NewReader(""))
+	}
+	cmd.Stderr = cmd.Stdout
+
+	if err := cmd.Start(); err != nil {
+		log.Error(err)
+	}
+
+	return tasks.ExecCmd{Cmd: cmd}, r
 }
 
 func (gui *Gui) newStringTask(view *gocui.View, str string) error {
@@ -50,14 +88,32 @@ func (gui *Gui) newStringTask(view *gocui.View, str string) error {
 func (gui *Gui) newStringTaskWithoutScroll(view *gocui.View, str string) error {
 	manager := gui.getManager(view)
 
-	f := func(stop chan struct{}) error {
-		gui.setViewContent(view, str)
-		return nil
+	f := func(tasks.TaskOpts) error {
+		return gui.g.OnUIThreadAndWaitBackground(func() {
+			gui.c.SetViewContent(view, str)
+			gui.reApplySearch(view)
+		})
 	}
 
-	// Using empty key so that on subsequent calls we won't reset the view's origin.
-	// Note this means that we will be scrolling back to the top if we're switching from a different key
-	if err := manager.NewTask(f, ""); err != nil {
+	if err := manager.NewTask(f, manager.GetTaskKey()); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (gui *Gui) newStringTaskWithScroll(view *gocui.View, str string, originX int, originY int) error {
+	manager := gui.getManager(view)
+
+	f := func(tasks.TaskOpts) error {
+		return gui.g.OnUIThreadAndWaitBackground(func() {
+			gui.c.SetViewContent(view, str)
+			view.SetOrigin(originX, originY)
+			gui.reApplySearch(view)
+		})
+	}
+
+	if err := manager.NewTask(f, manager.GetTaskKey()); err != nil {
 		return err
 	}
 
@@ -67,9 +123,12 @@ func (gui *Gui) newStringTaskWithoutScroll(view *gocui.View, str string) error {
 func (gui *Gui) newStringTaskWithKey(view *gocui.View, str string, key string) error {
 	manager := gui.getManager(view)
 
-	f := func(stop chan struct{}) error {
-		gui.renderString(view, str)
-		return nil
+	f := func(tasks.TaskOpts) error {
+		return gui.g.OnUIThreadAndWaitBackground(func() {
+			gui.c.ResetViewOrigin(view)
+			gui.c.SetViewContent(view, str)
+			gui.reApplySearch(view)
+		})
 	}
 
 	if err := manager.NewTask(f, key); err != nil {
@@ -86,41 +145,55 @@ func (gui *Gui) getManager(view *gocui.View) *tasks.ViewBufferManager {
 			gui.Log,
 			view,
 			func() {
-				// we could clear here, but that actually has the effect of causing a flicker
-				// where the view may contain no content momentarily as the gui refreshes.
-				// Instead, we're rewinding the write pointer so that we will just start
-				// overwriting the existing content from the top down. Once we've reached
-				// the end of the content do display, we call view.FlushStaleCells() to
-				// clear out the remaining content from the previous render.
+				// Called before showing the "loading..." indicator: clear the
+				// displayed buffer so only "loading..." is shown. The actual content
+				// is rendered off-screen (beginRender below) and swapped in, so it
+				// never overwrites the displayed buffer incrementally.
 				view.Reset()
 			},
 			func() {
-				gui.render()
+				// As the task reads more lines, the only thing that changes is the
+				// view's content (and its scrollbar); the window layout doesn't. So a
+				// content-only render is enough, and it's much cheaper than a full
+				// layout-and-redraw on every read - which matters a lot when reading
+				// a long diff, where reads happen repeatedly as the user scrolls.
+				gui.renderContentOnly()
 			},
 			func() {
+				// The content is fully loaded now, so let the scrollbar track it
+				// directly again (it was held at the previous render's height while
+				// loading, see FreezeScrollbarHeight).
+				view.UnfreezeScrollbarHeight()
+
 				// Need to check if the content of the view is well past the origin.
-				// It would be better to use .ViewLinesHeight here (given it considers
-				// wrapping) but when this function is called they haven't been written to yet.
-				linesHeight := view.LinesHeight()
-				_, height := view.Size()
+				linesHeight := view.ViewLinesHeight()
 				_, originY := view.Origin()
 				if linesHeight < originY {
-					newOriginY := linesHeight - height
-					if newOriginY < 0 {
-						newOriginY = 0
-					}
-					err := view.SetOrigin(0, newOriginY)
-					if err != nil {
-						panic(err)
-					}
+					newOriginY := linesHeight
 
+					view.SetOrigin(0, newOriginY)
 				}
 
-				view.FlushStaleCells()
+				gui.reApplySearch(view)
 			},
 			func() {
-				_ = view.SetOrigin(0, 0)
+				view.SetOrigin(0, 0)
 			},
+			view.BeginOffscreenRender,
+			view.SwapInOffscreenRender,
+			func() gocui.Task {
+				// A background task: rendering content into a view is display
+				// work, not lazygit driving a git operation, so it must not
+				// count towards being busy and block a repo switch. These
+				// renders fire on nearly every focus/selection change, including
+				// the context activation that happens right before a menu/prompt
+				// handler runs (e.g. confirming worktree creation), which would
+				// otherwise make the switch that handler triggers refuse itself.
+				return gui.c.GocuiGui().NewBackgroundTask()
+			},
+			// Rendering is background work too (see above), so the view mutations
+			// it bounces onto the UI thread mustn't count towards being busy.
+			gui.g.OnUIThreadAndWaitBackground,
 		)
 		gui.viewBufferManagerMap[view.Name()] = manager
 	}

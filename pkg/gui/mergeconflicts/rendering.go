@@ -8,7 +8,8 @@ import (
 	"github.com/jesseduffield/lazygit/pkg/utils"
 )
 
-func ColoredConflictFile(content string, state *State, hasFocus bool) string {
+func ColoredConflictFile(state *State) string {
+	content := state.GetContent()
 	if len(state.conflicts) == 0 {
 		return content
 	}
@@ -20,22 +21,15 @@ func ColoredConflictFile(content string, state *State, hasFocus bool) string {
 			textStyle = style.FgRed
 		}
 
-		if hasFocus && state.conflictIndex < len(state.conflicts) && *state.conflicts[state.conflictIndex] == *conflict && shouldHighlightLine(i, conflict, state.Selection()) {
-			textStyle = textStyle.MergeStyle(theme.SelectedRangeBgColor).SetBold()
-		}
 		if i == conflict.end && len(remainingConflicts) > 0 {
 			conflict, remainingConflicts = shiftConflict(remainingConflicts)
 		}
-		outputBuffer.WriteString(textStyle.Sprint(line) + "\n")
+		outputBuffer.WriteString(textStyle.Sprint(line))
+		outputBuffer.WriteByte('\n')
 	}
 	return outputBuffer.String()
 }
 
 func shiftConflict(conflicts []*mergeConflict) (*mergeConflict, []*mergeConflict) {
 	return conflicts[0], conflicts[1:]
-}
-
-func shouldHighlightLine(index int, conflict *mergeConflict, selection Selection) bool {
-	selectionStart, selectionEnd := selection.bounds(conflict)
-	return index >= selectionStart && index <= selectionEnd
 }

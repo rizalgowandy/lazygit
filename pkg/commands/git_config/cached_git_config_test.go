@@ -1,6 +1,8 @@
 package git_config
 
 import (
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/jesseduffield/lazygit/pkg/utils"
@@ -48,12 +50,12 @@ func TestGetBool(t *testing.T) {
 	}
 
 	for _, s := range scenarios {
-		s := s
 		t.Run(s.testName, func(t *testing.T) {
 			fake := NewFakeGitConfig(s.mockResponses)
 			real := NewCachedGitConfig(
-				func(key string) (string, error) {
-					return fake.Get(key), nil
+				func(cmd *exec.Cmd) (string, error) {
+					assert.Equal(t, "config --get --null commit.gpgsign", strings.Join(cmd.Args[1:], " "))
+					return fake.Get("commit.gpgsign"), nil
 				},
 				utils.NewDummyLog(),
 			)
@@ -84,12 +86,12 @@ func TestGet(t *testing.T) {
 	}
 
 	for _, s := range scenarios {
-		s := s
 		t.Run(s.testName, func(t *testing.T) {
 			fake := NewFakeGitConfig(s.mockResponses)
 			real := NewCachedGitConfig(
-				func(key string) (string, error) {
-					return fake.Get(key), nil
+				func(cmd *exec.Cmd) (string, error) {
+					assert.Equal(t, "config --get --null commit.gpgsign", strings.Join(cmd.Args[1:], " "))
+					return fake.Get("commit.gpgsign"), nil
 				},
 				utils.NewDummyLog(),
 			)
@@ -101,9 +103,9 @@ func TestGet(t *testing.T) {
 	// verifying that the cache is used
 	count := 0
 	real := NewCachedGitConfig(
-		func(key string) (string, error) {
+		func(cmd *exec.Cmd) (string, error) {
 			count++
-			assert.Equal(t, "commit.gpgsign", key)
+			assert.Equal(t, "config --get --null commit.gpgsign", strings.Join(cmd.Args[1:], " "))
 			return "blah", nil
 		},
 		utils.NewDummyLog(),
@@ -113,4 +115,21 @@ func TestGet(t *testing.T) {
 	result = real.Get("commit.gpgsign")
 	assert.Equal(t, "blah", result)
 	assert.Equal(t, 1, count)
+}
+
+// The config commands run in the directory set by SetDir rather than in the
+// process's current directory: lazygit chdirs when switching repos, and config
+// reads issued for the previous repo after that must keep addressing the repo
+// they were created for.
+func TestSetDirPinsCommandsToDirectory(t *testing.T) {
+	real := NewCachedGitConfig(
+		func(cmd *exec.Cmd) (string, error) {
+			assert.Equal(t, "/path/to/repo", cmd.Dir)
+			return "blah", nil
+		},
+		utils.NewDummyLog(),
+	)
+	real.SetDir("/path/to/repo")
+	real.Get("commit.gpgsign")
+	real.GetGeneral("--local --get-regexp foo")
 }

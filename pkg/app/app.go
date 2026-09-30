@@ -2,346 +2,296 @@ package app
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 
-	"github.com/aybabtme/humanlog"
-	"github.com/jesseduffield/lazygit/pkg/commands"
-	"github.com/jesseduffield/lazygit/pkg/commands/git_config"
+	"github.com/go-errors/errors"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/afero"
+
+	appTypes "github.com/jesseduffield/lazygit/pkg/app/types"
+	"github.com/jesseduffield/lazygit/pkg/commands/direnv"
+	"github.com/jesseduffield/lazygit/pkg/commands/git_commands"
 	"github.com/jesseduffield/lazygit/pkg/commands/oscommands"
 	"github.com/jesseduffield/lazygit/pkg/common"
 	"github.com/jesseduffield/lazygit/pkg/config"
+	"github.com/jesseduffield/lazygit/pkg/constants"
 	"github.com/jesseduffield/lazygit/pkg/env"
 	"github.com/jesseduffield/lazygit/pkg/gui"
 	"github.com/jesseduffield/lazygit/pkg/i18n"
+	integrationTypes "github.com/jesseduffield/lazygit/pkg/integration/types"
+	"github.com/jesseduffield/lazygit/pkg/logs"
 	"github.com/jesseduffield/lazygit/pkg/updates"
-	"github.com/sirupsen/logrus"
 )
 
-// App struct
+// App is the struct that's instantiated from within main.go and it manages
+// bootstrapping and running the application.
 type App struct {
 	*common.Common
-	closers       []io.Closer
-	Config        config.AppConfigurer
-	OSCommand     *oscommands.OSCommand
-	GitCommand    *commands.GitCommand
-	Gui           *gui.Gui
-	Updater       *updates.Updater // may only need this on the Gui
-	ClientContext string
+	closers   []io.Closer
+	Config    config.AppConfigurer
+	OSCommand *oscommands.OSCommand
+	Gui       *gui.Gui
 }
 
-type errorMapping struct {
-	originalError string
-	newError      string
-}
+func Run(
+	config config.AppConfigurer,
+	common *common.Common,
+	startArgs appTypes.StartArgs,
+) {
+	app, err := NewApp(config, startArgs.IntegrationTest, common)
 
-func newProductionLogger(config config.AppConfigurer) *logrus.Logger {
-	log := logrus.New()
-	log.Out = ioutil.Discard
-	log.SetLevel(logrus.ErrorLevel)
-	return log
-}
+	if err == nil {
+		err = app.Run(startArgs)
+	}
 
-func getLogLevel() logrus.Level {
-	strLevel := os.Getenv("LOG_LEVEL")
-	level, err := logrus.ParseLevel(strLevel)
 	if err != nil {
-		return logrus.DebugLevel
+		if errorMessage, known := knownError(common.Tr, err); known {
+			log.Fatal(errorMessage)
+		}
+		newErr := errors.Wrap(err, 0)
+		stackTrace := newErr.ErrorStack()
+		app.Log.Error(stackTrace)
+
+		log.Fatalf("%s: %s\n\n%s", common.Tr.ErrorOccurred, constants.Links.Issues, stackTrace)
 	}
-	return level
 }
 
-func newDevelopmentLogger(configurer config.AppConfigurer) *logrus.Logger {
-	logger := logrus.New()
-	logger.SetLevel(getLogLevel())
-	logPath, err := config.LogPath()
-	if err != nil {
-		log.Fatal(err)
+func NewCommon(config config.AppConfigurer, log *logrus.Entry) (*common.Common, error) {
+	userConfig := config.GetUserConfig()
+	appState := config.GetAppState()
+	// Initialize with English for the time being; the real translation set for
+	// the configured language will be read after reading the user config
+	tr := i18n.EnglishTranslationSet()
+
+	cmn := &common.Common{
+		Log:      log,
+		Tr:       tr,
+		AppState: appState,
+		Debug:    config.GetDebug(),
+		Fs:       afero.NewOsFs(),
 	}
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		panic("unable to log to file") // TODO: don't panic (also, remove this call to the `panic` function)
-	}
-	logger.SetOutput(file)
-	return logger
+	cmn.SetUserConfig(userConfig)
+	return cmn, nil
 }
 
-func newLogger(config config.AppConfigurer) *logrus.Entry {
-	var log *logrus.Logger
-	if config.GetDebug() || os.Getenv("DEBUG") == "TRUE" {
-		log = newDevelopmentLogger(config)
-	} else {
-		log = newProductionLogger(config)
+func NewLogger(debug bool) *logrus.Entry {
+	if debug {
+		logPath, err := config.LogPath()
+		if err != nil {
+			log.Fatal(err)
+		}
+		return logs.NewDevelopmentLogger(logPath)
 	}
 
-	// highly recommended: tail -f development.log | humanlog
-	// https://github.com/aybabtme/humanlog
-	log.Formatter = &logrus.JSONFormatter{}
-
-	return log.WithFields(logrus.Fields{
-		"debug":     config.GetDebug(),
-		"version":   config.GetVersion(),
-		"commit":    config.GetCommit(),
-		"buildDate": config.GetBuildDate(),
-	})
+	return logs.NewProductionLogger()
 }
 
 // NewApp bootstrap a new application
-func NewApp(config config.AppConfigurer, filterPath string) (*App, error) {
-	userConfig := config.GetUserConfig()
-
+func NewApp(config config.AppConfigurer, test integrationTypes.IntegrationTest, common *common.Common) (*App, error) {
 	app := &App{
 		closers: []io.Closer{},
 		Config:  config,
+		Common:  common,
 	}
-	var err error
-	log := newLogger(config)
-	tr, err := i18n.NewTranslationSetFromConfig(log, userConfig.Gui.Language)
+
+	app.OSCommand = oscommands.NewOSCommand(common, config, oscommands.GetPlatform(), oscommands.NewNullGuiIO(app.Log))
+
+	updater, err := updates.NewUpdater(common, config, app.OSCommand)
 	if err != nil {
 		return app, err
 	}
 
-	app.Common = &common.Common{
-		Log:        log,
-		Tr:         tr,
-		UserConfig: userConfig,
-		Debug:      config.GetDebug(),
-	}
-
-	// if we are being called in 'demon' mode, we can just return here
-	app.ClientContext = os.Getenv("LAZYGIT_CLIENT_COMMAND")
-	if app.ClientContext != "" {
-		return app, nil
-	}
-
-	app.OSCommand = oscommands.NewOSCommand(app.Common, oscommands.GetPlatform())
-
-	app.Updater, err = updates.NewUpdater(app.Common, config, app.OSCommand)
+	dirName, err := os.Getwd()
 	if err != nil {
 		return app, err
 	}
 
-	showRecentRepos, err := app.setupRepo()
+	gitVersion, err := app.validateGitVersion()
 	if err != nil {
 		return app, err
 	}
 
-	app.GitCommand, err = commands.NewGitCommand(
-		app.Common,
-		app.OSCommand,
-		git_config.NewStdCachedGitConfig(app.Log),
-	)
+	// If we're not in a repo, GetRepoPaths will return an error. The error is moot for us
+	// at this stage, since we'll try to init a new repo in setupRepo(), below
+	repoPaths, err := git_commands.GetRepoPaths(app.OSCommand.Cmd, gitVersion)
+	if err != nil {
+		common.Log.Infof("Error getting repo paths: %v", err)
+	}
+
+	showRecentRepos, err := app.setupRepo(repoPaths)
 	if err != nil {
 		return app, err
 	}
 
-	app.Gui, err = gui.NewGui(app.Common, app.GitCommand, app.OSCommand, config, app.Updater, filterPath, showRecentRepos)
+	// used for testing purposes
+	if os.Getenv("SHOW_RECENT_REPOS") == "true" {
+		showRecentRepos = true
+	}
+
+	app.Gui, err = gui.NewGui(common, config, gitVersion, updater, showRecentRepos, dirName, test)
 	if err != nil {
 		return app, err
 	}
 	return app, nil
 }
 
-func (app *App) validateGitVersion() error {
-	output, err := app.OSCommand.Cmd.New("git --version").RunWithOutput()
+const minGitVersionStr = "2.32.0"
+
+func minGitVersionErrorMessage(tr *i18n.TranslationSet) string {
+	return fmt.Sprintf(tr.MinGitVersionError, minGitVersionStr)
+}
+
+func (app *App) validateGitVersion() (*git_commands.GitVersion, error) {
+	version, err := git_commands.GetGitVersion(app.OSCommand)
 	// if we get an error anywhere here we'll show the same status
-	minVersionError := errors.New(app.Tr.MinGitVersionError)
+	minVersionError := errors.New(minGitVersionErrorMessage(app.Tr))
 	if err != nil {
-		return minVersionError
+		return nil, minVersionError
 	}
 
-	if isGitVersionValid(output) {
-		return nil
+	minRequiredVersion, _ := git_commands.ParseGitVersion(minGitVersionStr)
+	if version.IsOlderThanVersion(minRequiredVersion) {
+		return nil, minVersionError
 	}
 
-	return minVersionError
+	return version, nil
 }
 
-func isGitVersionValid(versionStr string) bool {
-	// output should be something like: 'git version 2.23.0 (blah)'
-	re := regexp.MustCompile(`[^\d]+([\d\.]+)`)
-	matches := re.FindStringSubmatch(versionStr)
-
-	if len(matches) == 0 {
-		return false
-	}
-
-	gitVersion := matches[1]
-	majorVersion, err := strconv.Atoi(gitVersion[0:1])
-	if err != nil {
-		return false
-	}
-	if majorVersion < 2 {
-		return false
-	}
-
-	return true
+func isDirectoryAGitRepository(dir string) (bool, error) {
+	info, err := os.Stat(filepath.Join(dir, ".git"))
+	return info != nil, err
 }
 
-func (app *App) setupRepo() (bool, error) {
-	if err := app.validateGitVersion(); err != nil {
-		return false, err
+func openRecentRepo(app *App) bool {
+	for _, repoDir := range app.Config.GetAppState().RecentRepos {
+		if isRepo, _ := isDirectoryAGitRepository(repoDir); isRepo {
+			if err := os.Chdir(repoDir); err == nil {
+				// We're still in setup, before the gui exists, so we can't show the approval popup
+				// that DispatchSwitchTo offers for blocked .envrc files; just log and move on.
+				// Also, the logs only go to the debug log, not the Command Log, because that's not
+				// available yet, either.
+				result := direnv.Load(app.OSCommand.Cmd)
+				if result.Message != "" {
+					app.Log.WithField("message", result.Message).Info("direnv")
+				}
+				if result.Err != nil {
+					app.Log.WithError(result.Err).Warn("direnv load failed")
+				}
+				return true
+			}
+		}
 	}
 
+	return false
+}
+
+func (app *App) setupRepo(
+	repoPaths *git_commands.RepoPaths,
+) (bool, error) {
 	if env.GetGitDirEnv() != "" {
-		// we've been given the git dir directly. We'll verify this dir when initializing our GitCommand object
+		// we've been given the git dir directly. Skip setup
 		return false, nil
 	}
 
 	// if we are not in a git repo, we ask if we want to `git init`
-	if err := commands.VerifyInGitRepo(app.OSCommand); err != nil {
+	if repoPaths == nil {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return false, err
 		}
-		info, _ := os.Stat(filepath.Join(cwd, ".git"))
-		if info != nil && info.IsDir() {
-			return false, err // Current directory appears to be a git repository.
+
+		if isRepo, err := isDirectoryAGitRepository(cwd); isRepo {
+			return false, err
 		}
 
-		shouldInitRepo := true
-		notARepository := app.UserConfig.NotARepository
-		if notARepository == "prompt" {
+		var shouldInitRepo bool
+		initialBranchArg := ""
+		switch app.UserConfig().NotARepository {
+		case "prompt":
 			// Offer to initialize a new repository in current directory.
 			fmt.Print(app.Tr.CreateRepo)
 			response, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-			if strings.Trim(response, " \n") != "y" {
-				shouldInitRepo = false
+			shouldInitRepo = (strings.Trim(response, " \r\n") == "y")
+			if shouldInitRepo {
+				// Ask for the initial branch name
+				fmt.Print(app.Tr.InitialBranch)
+				response, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+				if trimmedResponse := strings.Trim(response, " \r\n"); len(trimmedResponse) > 0 {
+					initialBranchArg += "--initial-branch=" + trimmedResponse
+				}
 			}
-		} else if notARepository == "skip" {
+		case "create":
+			shouldInitRepo = true
+		case "skip":
 			shouldInitRepo = false
+		case "quit":
+			fmt.Fprintln(os.Stderr, app.Tr.NotARepository)
+			os.Exit(1)
+		default:
+			fmt.Fprintln(os.Stderr, app.Tr.IncorrectNotARepository)
+			os.Exit(1)
 		}
 
-		if !shouldInitRepo {
-			// check if we have a recent repo we can open
-			recentRepos := app.Config.GetAppState().RecentRepos
-			if len(recentRepos) > 0 {
-				var err error
-				// try opening each repo in turn, in case any have been deleted
-				for _, repoDir := range recentRepos {
-					if err = os.Chdir(repoDir); err == nil {
-						return true, nil
-					}
-				}
+		if shouldInitRepo {
+			args := []string{"git", "init"}
+			if initialBranchArg != "" {
+				args = append(args, initialBranchArg)
+			}
+			if err := app.OSCommand.Cmd.New(args).Run(); err != nil {
 				return false, err
 			}
 
-			os.Exit(1)
+			return false, nil
 		}
-		if err := app.OSCommand.Cmd.New("git init").Run(); err != nil {
-			return false, err
+
+		// check if we have a recent repo we can open
+		if openRecentRepo(app) {
+			return true, nil
 		}
+
+		fmt.Fprintln(os.Stderr, app.Tr.NoRecentRepositories)
+		os.Exit(1)
+	}
+
+	// Run this afterward so that the previous repo creation steps can run without this interfering
+	if repoPaths.IsBareRepo() {
+
+		fmt.Print(app.Tr.BareRepo)
+
+		response, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+
+		if shouldOpenRecent := strings.Trim(response, " \r\n") == "y"; !shouldOpenRecent {
+			os.Exit(0)
+		}
+
+		if openRecentRepo(app) {
+			return true, nil
+		}
+
+		fmt.Println(app.Tr.NoRecentRepositories)
+		os.Exit(1)
 	}
 
 	return false, nil
 }
 
-func (app *App) Run() error {
-	if app.ClientContext == "INTERACTIVE_REBASE" {
-		return app.Rebase()
-	}
-
-	if app.ClientContext == "EXIT_IMMEDIATELY" {
-		os.Exit(0)
-	}
-
-	err := app.Gui.RunAndHandleError()
+func (app *App) Run(startArgs appTypes.StartArgs) error {
+	err := app.Gui.RunAndHandleError(startArgs)
 	return err
-}
-
-func gitDir() string {
-	dir := env.GetGitDirEnv()
-	if dir == "" {
-		return ".git"
-	}
-	return dir
-}
-
-// Rebase contains logic for when we've been run in demon mode, meaning we've
-// given lazygit as a command for git to call e.g. to edit a file
-func (app *App) Rebase() error {
-	app.Log.Info("Lazygit invoked as interactive rebase demon")
-	app.Log.Info("args: ", os.Args)
-
-	if strings.HasSuffix(os.Args[1], "git-rebase-todo") {
-		if err := ioutil.WriteFile(os.Args[1], []byte(os.Getenv("LAZYGIT_REBASE_TODO")), 0644); err != nil {
-			return err
-		}
-
-	} else if strings.HasSuffix(os.Args[1], filepath.Join(gitDir(), "COMMIT_EDITMSG")) { // TODO: test
-		// if we are rebasing and squashing, we'll see a COMMIT_EDITMSG
-		// but in this case we don't need to edit it, so we'll just return
-	} else {
-		app.Log.Info("Lazygit demon did not match on any use cases")
-	}
-
-	return nil
 }
 
 // Close closes any resources
 func (app *App) Close() error {
 	for _, closer := range app.closers {
-		err := closer.Close()
-		if err != nil {
+		if err := closer.Close(); err != nil {
 			return err
 		}
 	}
+
 	return nil
-}
-
-// KnownError takes an error and tells us whether it's an error that we know about where we can print a nicely formatted version of it rather than panicking with a stack trace
-func (app *App) KnownError(err error) (string, bool) {
-	errorMessage := err.Error()
-
-	knownErrorMessages := []string{app.Tr.MinGitVersionError}
-
-	for _, message := range knownErrorMessages {
-		if errorMessage == message {
-			return message, true
-		}
-	}
-
-	mappings := []errorMapping{
-		{
-			originalError: "fatal: not a git repository",
-			newError:      app.Tr.NotARepository,
-		},
-	}
-
-	for _, mapping := range mappings {
-		if strings.Contains(errorMessage, mapping.originalError) {
-			return mapping.newError, true
-		}
-	}
-	return "", false
-}
-
-func TailLogs() {
-	logFilePath, err := config.LogPath()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("Tailing log file %s\n\n", logFilePath)
-
-	opts := humanlog.DefaultOptions
-	opts.Truncates = false
-
-	_, err = os.Stat(logFilePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Fatal("Log file does not exist. Run `lazygit --debug` first to create the log file")
-		}
-		log.Fatal(err)
-	}
-
-	TailLogsForPlatform(logFilePath, opts)
 }

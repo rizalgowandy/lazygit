@@ -1,9 +1,8 @@
 package tasks
 
 import (
-	"sync"
-
-	"github.com/jesseduffield/lazygit/pkg/utils"
+	"github.com/jesseduffield/lazygit/pkg/gocui"
+	"github.com/sasha-s/go-deadlock"
 )
 
 // the purpose of an AsyncHandler is to ensure that if we have multiple long-running
@@ -17,13 +16,15 @@ import (
 type AsyncHandler struct {
 	currentId int
 	lastId    int
-	mutex     sync.Mutex
+	mutex     deadlock.Mutex
 	onReject  func()
+	onWorker  func(func(gocui.Task) error)
 }
 
-func NewAsyncHandler() *AsyncHandler {
+func NewAsyncHandler(onWorker func(func(gocui.Task) error)) *AsyncHandler {
 	return &AsyncHandler{
-		mutex: sync.Mutex{},
+		mutex:    deadlock.Mutex{},
+		onWorker: onWorker,
 	}
 }
 
@@ -33,9 +34,10 @@ func (self *AsyncHandler) Do(f func() func()) {
 	id := self.currentId
 	self.mutex.Unlock()
 
-	go utils.Safe(func() {
+	self.onWorker(func(gocui.Task) error {
 		after := f()
 		self.handle(after, id)
+		return nil
 	})
 }
 

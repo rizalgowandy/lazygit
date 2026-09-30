@@ -1,199 +1,55 @@
 package gui
 
 import (
-	"fmt"
-	"sort"
-	"strings"
-	"sync"
+	"time"
 
-	"github.com/jesseduffield/gocui"
+	"github.com/jesseduffield/lazygit/pkg/gocui"
+	"github.com/jesseduffield/lazygit/pkg/gui/context"
+	"github.com/jesseduffield/lazygit/pkg/gui/types"
+	"github.com/jesseduffield/lazygit/pkg/tasks"
 	"github.com/jesseduffield/lazygit/pkg/utils"
 	"github.com/spkg/bom"
 )
 
-func (gui *Gui) getCyclableWindows() []string {
-	return []string{"status", "files", "branches", "commits", "stash"}
+func (gui *Gui) resetViewOrigin(v *gocui.View) {
+	v.SetCursor(0, 0)
+	v.SetOrigin(0, 0)
 }
 
-// models/views that we can refresh
-type RefreshableView int
+// Returns the number of lines that we should read initially from a cmd task so
+// that the scrollbar has the correct size, along with the number of lines after
+// which the view is filled and we can do a first refresh.
+func (gui *Gui) linesToReadFromCmdTask(v *gocui.View) tasks.LinesToRead {
+	height := v.InnerHeight()
+	oy := v.OriginY()
 
-const (
-	COMMITS RefreshableView = iota
-	BRANCHES
-	FILES
-	STASH
-	REFLOG
-	TAGS
-	REMOTES
-	STATUS
-	SUBMODULES
-)
+	linesForFirstRefresh := height + oy + 10
 
-func getScopeNames(scopes []RefreshableView) []string {
-	scopeNameMap := map[RefreshableView]string{
-		COMMITS:    "commits",
-		BRANCHES:   "branches",
-		FILES:      "files",
-		SUBMODULES: "submodules",
-		STASH:      "stash",
-		REFLOG:     "reflog",
-		TAGS:       "tags",
-		REMOTES:    "remotes",
-		STATUS:     "status",
-	}
-
-	scopeNames := make([]string, len(scopes))
-	for i, scope := range scopes {
-		scopeNames[i] = scopeNameMap[scope]
-	}
-
-	return scopeNames
-}
-
-func getModeName(mode RefreshMode) string {
-	switch mode {
-	case SYNC:
-		return "sync"
-	case ASYNC:
-		return "async"
-	case BLOCK_UI:
-		return "block-ui"
-	default:
-		return "unknown mode"
-	}
-}
-
-type RefreshMode int
-
-const (
-	SYNC     RefreshMode = iota // wait until everything is done before returning
-	ASYNC                       // return immediately, allowing each independent thing to update itself
-	BLOCK_UI                    // wrap code in an update call to ensure UI updates all at once and keybindings aren't executed till complete
-)
-
-type refreshOptions struct {
-	then  func()
-	scope []RefreshableView // e.g. []int{COMMITS, BRANCHES}. Leave empty to refresh everything
-	mode  RefreshMode       // one of SYNC (default), ASYNC, and BLOCK_UI
-}
-
-func arrToMap(arr []RefreshableView) map[RefreshableView]bool {
-	output := map[RefreshableView]bool{}
-	for _, el := range arr {
-		output[el] = true
-	}
-	return output
-}
-
-func (gui *Gui) refreshSidePanels(options refreshOptions) error {
-	if options.scope == nil {
-		gui.Log.Infof(
-			"refreshing all scopes in %s mode",
-			getModeName(options.mode),
-		)
-	} else {
-		gui.Log.Infof(
-			"refreshing the following scopes in %s mode: %s",
-			getModeName(options.mode),
-			strings.Join(getScopeNames(options.scope), ","),
-		)
-	}
-
-	wg := sync.WaitGroup{}
-
-	f := func() {
-		var scopeMap map[RefreshableView]bool
-		if len(options.scope) == 0 {
-			scopeMap = arrToMap([]RefreshableView{COMMITS, BRANCHES, FILES, STASH, REFLOG, TAGS, REMOTES, STATUS})
-		} else {
-			scopeMap = arrToMap(options.scope)
-		}
-
-		if scopeMap[COMMITS] || scopeMap[BRANCHES] || scopeMap[REFLOG] {
-			wg.Add(1)
-			func() {
-				if options.mode == ASYNC {
-					go utils.Safe(func() { _ = gui.refreshCommits() })
-				} else {
-					_ = gui.refreshCommits()
-				}
-				wg.Done()
-			}()
-		}
-
-		if scopeMap[FILES] || scopeMap[SUBMODULES] {
-			wg.Add(1)
-			func() {
-				if options.mode == ASYNC {
-					go utils.Safe(func() { _ = gui.refreshFilesAndSubmodules() })
-				} else {
-					_ = gui.refreshFilesAndSubmodules()
-				}
-				wg.Done()
-			}()
-		}
-
-		if scopeMap[STASH] {
-			wg.Add(1)
-			func() {
-				if options.mode == ASYNC {
-					go utils.Safe(func() { _ = gui.refreshStashEntries() })
-				} else {
-					_ = gui.refreshStashEntries()
-				}
-				wg.Done()
-			}()
-		}
-
-		if scopeMap[TAGS] {
-			wg.Add(1)
-			func() {
-				if options.mode == ASYNC {
-					go utils.Safe(func() { _ = gui.refreshTags() })
-				} else {
-					_ = gui.refreshTags()
-				}
-				wg.Done()
-			}()
-		}
-
-		if scopeMap[REMOTES] {
-			wg.Add(1)
-			func() {
-				if options.mode == ASYNC {
-					go utils.Safe(func() { _ = gui.refreshRemotes() })
-				} else {
-					_ = gui.refreshRemotes()
-				}
-				wg.Done()
-			}()
-		}
-
-		wg.Wait()
-
-		gui.refreshStatus()
-
-		if options.then != nil {
-			options.then()
+	// A search counts the matches in everything the view holds, so a re-render of a
+	// view that is being searched is read all the way to the end (as opening the
+	// search prompt reads it, see MainViewController.openSearch). Lines left unread
+	// hold matches the search doesn't know about, and would add themselves to the
+	// "x of y" as the user scrolled far enough to load them.
+	if v.IsSearching() {
+		return tasks.LinesToRead{
+			Total:               -1,
+			InitialRefreshAfter: linesForFirstRefresh,
 		}
 	}
 
-	if options.mode == BLOCK_UI {
-		gui.g.Update(func(g *gocui.Gui) error {
-			f()
-			return nil
-		})
-	} else {
-		f()
+	// We want to read as many lines initially as necessary to let the
+	// scrollbar go to its minimum height, so that the scrollbar thumb doesn't
+	// change size as you scroll down.
+	minScrollbarHeight := 1
+	linesToReadForAccurateScrollbar := min(
+		// However, cap it at some arbitrary max limit, so that we don't get
+		// performance problems for huge monitors or tiny font sizes
+		height*(height-1)/minScrollbarHeight+oy, 5000)
+
+	return tasks.LinesToRead{
+		Total:               linesToReadForAccurateScrollbar,
+		InitialRefreshAfter: linesForFirstRefresh,
 	}
-
-	return nil
-}
-
-func (gui *Gui) resetOrigin(v *gocui.View) error {
-	_ = v.SetCursor(0, 0)
-	return v.SetOrigin(0, 0)
 }
 
 func (gui *Gui) cleanString(s string) string {
@@ -201,46 +57,8 @@ func (gui *Gui) cleanString(s string) string {
 	return utils.NormalizeLinefeeds(output)
 }
 
-func (gui *Gui) setViewContentSync(v *gocui.View, s string) {
-	v.SetContent(gui.cleanString(s))
-}
-
 func (gui *Gui) setViewContent(v *gocui.View, s string) {
-	gui.g.Update(func(*gocui.Gui) error {
-		gui.setViewContentSync(v, s)
-		return nil
-	})
-}
-
-// renderString resets the origin of a view and sets its content
-func (gui *Gui) renderString(view *gocui.View, s string) {
-	gui.g.Update(func(*gocui.Gui) error {
-		return gui.renderStringSync(view, s)
-	})
-}
-
-func (gui *Gui) renderStringSync(view *gocui.View, s string) error {
-	if err := view.SetOrigin(0, 0); err != nil {
-		return err
-	}
-	if err := view.SetCursor(0, 0); err != nil {
-		return err
-	}
-	gui.setViewContentSync(view, s)
-	return nil
-}
-
-func (gui *Gui) optionsMapToString(optionsMap map[string]string) string {
-	optionsArray := make([]string, 0)
-	for key, description := range optionsMap {
-		optionsArray = append(optionsArray, key+": "+description)
-	}
-	sort.Strings(optionsArray)
-	return strings.Join(optionsArray, ", ")
-}
-
-func (gui *Gui) renderOptionsMap(optionsMap map[string]string) {
-	gui.renderString(gui.Views.Options, gui.optionsMapToString(optionsMap))
+	v.SetContent(gui.cleanString(s))
 }
 
 func (gui *Gui) currentViewName() string {
@@ -251,145 +69,117 @@ func (gui *Gui) currentViewName() string {
 	return currentView.Name()
 }
 
-func (gui *Gui) resizeCurrentPopupPanel() error {
-	v := gui.g.CurrentView()
-	if v == nil {
+func (gui *Gui) onViewTabClick(windowName string, tabIndex int) error {
+	tabs := gui.viewTabMap()[windowName]
+	if len(tabs) == 0 {
 		return nil
 	}
-	if gui.isPopupPanel(v.Name()) {
-		return gui.resizePopupPanel(v, v.Buffer())
+
+	viewName := tabs[tabIndex].ViewName
+
+	context, ok := gui.helpers.View.ContextForView(viewName)
+	if !ok {
+		return nil
 	}
+
+	gui.c.Context().Push(context, types.OnFocusOpts{})
 	return nil
 }
 
-func (gui *Gui) resizePopupPanel(v *gocui.View, content string) error {
-	// If the confirmation panel is already displayed, just resize the width,
-	// otherwise continue
-	x0, y0, x1, y1 := gui.getConfirmationPanelDimensions(v.Wrap, content)
-	vx0, vy0, vx1, vy1 := v.Dimensions()
-	if vx0 == x0 && vy0 == y0 && vx1 == x1 && vy1 == y1 {
-		return nil
-	}
-	_, err := gui.g.SetView(v.Name(), x0, y0, x1, y1, 0)
-	return err
-}
-
-func (gui *Gui) changeSelectedLine(panelState IListPanelState, total int, change int) {
-	// TODO: find out why we're doing this
-	line := panelState.GetSelectedLineIdx()
-
-	if line == -1 {
-		return
-	}
-	var newLine int
-	if line+change < 0 {
-		newLine = 0
-	} else if line+change >= total {
-		newLine = total - 1
-	} else {
-		newLine = line + change
-	}
-
-	panelState.SetSelectedLineIdx(newLine)
-}
-
-func (gui *Gui) refreshSelectedLine(panelState IListPanelState, total int) {
-	line := panelState.GetSelectedLineIdx()
-
-	if line == -1 && total > 0 {
-		panelState.SetSelectedLineIdx(0)
-	} else if total-1 < line {
-		panelState.SetSelectedLineIdx(total - 1)
-	}
-}
-
-func (gui *Gui) renderDisplayStrings(v *gocui.View, displayStrings [][]string) {
-	list := utils.RenderDisplayStrings(displayStrings)
-	v.SetContent(list)
-}
-
-func (gui *Gui) renderDisplayStringsAtPos(v *gocui.View, y int, displayStrings [][]string) {
-	list := utils.RenderDisplayStrings(displayStrings)
-	v.OverwriteLines(y, list)
-}
-
-func (gui *Gui) globalOptionsMap() map[string]string {
-	keybindingConfig := gui.UserConfig.Keybinding
-
-	return map[string]string{
-		fmt.Sprintf("%s/%s", gui.getKeyDisplay(keybindingConfig.Universal.ScrollUpMain), gui.getKeyDisplay(keybindingConfig.Universal.ScrollDownMain)):                                                                                                               gui.Tr.LcScroll,
-		fmt.Sprintf("%s %s %s %s", gui.getKeyDisplay(keybindingConfig.Universal.PrevBlock), gui.getKeyDisplay(keybindingConfig.Universal.NextBlock), gui.getKeyDisplay(keybindingConfig.Universal.PrevItem), gui.getKeyDisplay(keybindingConfig.Universal.NextItem)): gui.Tr.LcNavigate,
-		gui.getKeyDisplay(keybindingConfig.Universal.Return):     gui.Tr.LcCancel,
-		gui.getKeyDisplay(keybindingConfig.Universal.Quit):       gui.Tr.LcQuit,
-		gui.getKeyDisplay(keybindingConfig.Universal.OptionMenu): gui.Tr.LcMenu,
-		fmt.Sprintf("%s-%s", gui.getKeyDisplay(keybindingConfig.Universal.JumpToBlock[0]), gui.getKeyDisplay(keybindingConfig.Universal.JumpToBlock[len(keybindingConfig.Universal.JumpToBlock)-1])): gui.Tr.LcJump,
-		fmt.Sprintf("%s/%s", gui.getKeyDisplay(keybindingConfig.Universal.ScrollLeft), gui.getKeyDisplay(keybindingConfig.Universal.ScrollRight)):                                                    gui.Tr.LcScrollLeftRight,
-	}
-}
-
-func (gui *Gui) isPopupPanel(viewName string) bool {
-	return viewName == "commitMessage" || viewName == "credentials" || viewName == "confirmation" || viewName == "menu"
-}
-
-func (gui *Gui) popupPanelFocused() bool {
-	return gui.isPopupPanel(gui.currentViewName())
-}
-
-// secondaryViewFocused tells us whether it appears that the secondary view is focused. The view is actually never focused for real: we just swap the main and secondary views and then you're still focused on the main view so that we can give you access to all its keybindings for free. I will probably regret this design decision soon enough.
-func (gui *Gui) secondaryViewFocused() bool {
-	state := gui.State.Panels.LineByLine
-	return state != nil && state.SecondaryFocused
-}
-
-func (gui *Gui) onViewTabClick(viewName string, tabIndex int) error {
-	context := gui.State.ViewTabContextMap[viewName][tabIndex].contexts[0]
-
-	return gui.pushContext(context)
-}
-
 func (gui *Gui) handleNextTab() error {
-	v := getTabbedView(gui)
-	if v == nil {
+	view := getTabbedView(gui)
+	if view == nil {
 		return nil
 	}
 
-	return gui.onViewTabClick(
-		v.Name(),
-		utils.ModuloWithWrap(v.TabIndex+1, len(v.Tabs)),
-	)
+	for _, context := range gui.State.Contexts.Flatten() {
+		if context.GetViewName() == view.Name() {
+			return gui.onViewTabClick(
+				context.GetWindowName(),
+				utils.ModuloWithWrap(view.TabIndex+1, len(view.Tabs)),
+			)
+		}
+	}
+
+	return nil
 }
 
 func (gui *Gui) handlePrevTab() error {
-	v := getTabbedView(gui)
-	if v == nil {
+	view := getTabbedView(gui)
+	if view == nil {
 		return nil
 	}
 
-	return gui.onViewTabClick(
-		v.Name(),
-		utils.ModuloWithWrap(v.TabIndex-1, len(v.Tabs)),
-	)
-}
-
-// this is the distance we will move the cursor when paging up or down in a view
-func (gui *Gui) pageDelta(view *gocui.View) int {
-	_, height := view.Size()
-
-	delta := height - 1
-	if delta == 0 {
-		return 1
+	for _, context := range gui.State.Contexts.Flatten() {
+		if context.GetViewName() == view.Name() {
+			return gui.onViewTabClick(
+				context.GetWindowName(),
+				utils.ModuloWithWrap(view.TabIndex-1, len(view.Tabs)),
+			)
+		}
 	}
 
-	return delta
+	return nil
 }
 
 func getTabbedView(gui *Gui) *gocui.View {
 	// It safe assumption that only static contexts have tabs
-	context := gui.currentStaticContext()
+	context := gui.c.Context().CurrentStatic()
 	view, _ := gui.g.View(context.GetViewName())
 	return view
 }
 
 func (gui *Gui) render() {
-	gui.g.Update(func(g *gocui.Gui) error { return nil })
+	gui.c.OnUIThread(func() error { return nil })
+}
+
+// renderContentOnly triggers a re-render that skips the layout pass and only
+// redraws the views whose content changed (relying on tcell's cell-level dirty
+// tracking to emit just the cells that actually differ). Use it when only a
+// view's content changed, not the window layout.
+func (gui *Gui) renderContentOnly() {
+	gui.c.OnUIThreadContentOnly(func() error { return nil })
+}
+
+// postRefreshUpdate is to be called on a context after the state that it depends on has been refreshed
+// if the context's view is set to another context we do nothing.
+// if the context's view is the current view we trigger a focus; re-selecting the current item.
+func (gui *Gui) postRefreshUpdate(c types.Context, opts types.OnFocusOpts) {
+	t := time.Now()
+	defer func() {
+		gui.Log.Infof("postRefreshUpdate for %s took %s", c.GetKey(), time.Since(t))
+	}()
+
+	c.HandleRender()
+
+	// The render may have given the context its first item, or taken its last one
+	// away, which decides whether its view draws a selection at all.
+	gui.State.ContextMgr.updateSelectionHighlights()
+
+	if gui.currentViewName() == c.GetInputViewName() {
+		c.HandleFocus(opts)
+	} else {
+		// The FocusLine call is included in the HandleFocus method which we
+		// call for focused views above; but we need to call it here for
+		// non-focused views to ensure that an inactive selection is painted
+		// correctly, and that integration tests see the up to date selection
+		// state.
+		c.FocusLine(!opts.KeepScrollPosition)
+		if opts.SkipMainViewUpdate {
+			return
+		}
+
+		currentCtx := gui.State.ContextMgr.Current()
+		if currentCtx.GetKey() == context.NORMAL_MAIN_CONTEXT_KEY || currentCtx.GetKey() == context.NORMAL_SECONDARY_CONTEXT_KEY {
+			sidePanelContext := gui.State.ContextMgr.NextInStack(currentCtx)
+			if sidePanelContext != nil && sidePanelContext.GetKey() == c.GetKey() {
+				sidePanelContext.HandleRenderToMain()
+			}
+		} else if c.GetKey() == gui.State.ContextMgr.CurrentStatic().GetKey() {
+			// If our view is not the current one, but it is the current static context, then this
+			// can only mean that a popup is showing. In that case we want to refresh the main view
+			// behind the popup.
+			c.HandleRenderToMain()
+		}
+	}
 }

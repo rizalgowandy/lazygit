@@ -1,41 +1,12 @@
 package utils
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
-
-// TestMin is a function.
-func TestMin(t *testing.T) {
-	type scenario struct {
-		a        int
-		b        int
-		expected int
-	}
-
-	scenarios := []scenario{
-		{
-			1,
-			1,
-			1,
-		},
-		{
-			1,
-			2,
-			1,
-		},
-		{
-			2,
-			1,
-			1,
-		},
-	}
-
-	for _, s := range scenarios {
-		assert.EqualValues(t, s.expected, Min(s.a, s.b))
-	}
-}
 
 func TestAsJson(t *testing.T) {
 	type myStruct struct {
@@ -85,5 +56,96 @@ func TestSafeTruncate(t *testing.T) {
 
 	for _, s := range scenarios {
 		assert.EqualValues(t, s.expected, SafeTruncate(s.str, s.limit))
+	}
+}
+
+func TestModuloWithWrap(t *testing.T) {
+	type scenario struct {
+		n        int
+		max      int
+		expected int
+	}
+
+	scenarios := []scenario{
+		{
+			n:        0,
+			max:      0,
+			expected: 0,
+		},
+		{
+			n:        0,
+			max:      1,
+			expected: 0,
+		},
+		{
+			n:        1,
+			max:      0,
+			expected: 0,
+		},
+		{
+			n:        3,
+			max:      2,
+			expected: 1,
+		},
+		{
+			n:        -1,
+			max:      2,
+			expected: 1,
+		},
+	}
+
+	for _, s := range scenarios {
+		if s.expected != ModuloWithWrap(s.n, s.max) {
+			t.Errorf("expected %d, got %d, for n: %d, max: %d", s.expected, ModuloWithWrap(s.n, s.max), s.n, s.max)
+		}
+	}
+}
+
+func TestExpandTilde(t *testing.T) {
+	home, err := os.UserHomeDir()
+	assert.NoError(t, err)
+
+	scenarios := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{"bare tilde", "~", home},
+		{"tilde with subpath", "~/worktrees", filepath.Join(home, "worktrees")},
+		{"absolute path is untouched", "/absolute/path", "/absolute/path"},
+		{"relative path is untouched", "relative/path", "relative/path"},
+		{"tilde not at the start is untouched", "/foo/~/bar", "/foo/~/bar"},
+		{"tilde followed by a username is untouched", "~other/worktrees", "~other/worktrees"},
+		{"empty string is untouched", "", ""},
+	}
+
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
+			assert.Equal(t, s.expected, ExpandTilde(s.path))
+		})
+	}
+}
+
+func TestContractTilde(t *testing.T) {
+	home, err := os.UserHomeDir()
+	assert.NoError(t, err)
+
+	scenarios := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{"home directory", home, "~"},
+		{"path inside the home directory", filepath.Join(home, "worktrees"), filepath.Join("~", "worktrees")},
+		{"path outside the home directory is untouched", filepath.Join("/absolute", "path"), filepath.Join("/absolute", "path")},
+		{"path merely starting with the home directory's name is untouched", home + "-backup", home + "-backup"},
+		{"relative path is untouched", filepath.Join("relative", "path"), filepath.Join("relative", "path")},
+		{"empty string is untouched", "", ""},
+	}
+
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
+			assert.Equal(t, s.expected, ContractTilde(s.path))
+		})
 	}
 }

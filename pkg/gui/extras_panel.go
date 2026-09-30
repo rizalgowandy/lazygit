@@ -3,60 +3,98 @@ package gui
 import (
 	"io"
 
+	"github.com/jesseduffield/lazygit/pkg/gocui"
+	"github.com/jesseduffield/lazygit/pkg/gui/context"
 	"github.com/jesseduffield/lazygit/pkg/gui/style"
+	"github.com/jesseduffield/lazygit/pkg/gui/types"
 )
 
 func (gui *Gui) handleCreateExtrasMenuPanel() error {
-	menuItems := []*menuItem{
-		{
-			displayString: gui.Tr.ToggleShowCommandLog,
-			onPress: func() error {
-				currentContext := gui.currentStaticContext()
-				if gui.ShowExtrasWindow && currentContext.GetKey() == COMMAND_LOG_CONTEXT_KEY {
-					if err := gui.returnFromContext(); err != nil {
-						return err
+	return gui.c.Menu(types.CreateMenuOptions{
+		Title: gui.c.Tr.CommandLog,
+		Items: []*types.MenuItem{
+			{
+				Label: gui.c.Tr.ToggleShowCommandLog,
+				Keys:  []gocui.Key{gocui.NewKeyRune('t')},
+				OnPress: func() error {
+					currentContext := gui.c.Context().CurrentStatic()
+					if gui.c.State().GetShowExtrasWindow() && currentContext.GetKey() == context.COMMAND_LOG_CONTEXT_KEY {
+						gui.c.Context().Pop()
 					}
-				}
-				show := !gui.ShowExtrasWindow
-				gui.ShowExtrasWindow = show
-				gui.Config.GetAppState().HideCommandLog = !show
-				_ = gui.Config.SaveAppState()
-				return nil
+					show := !gui.c.State().GetShowExtrasWindow()
+					gui.c.State().SetShowExtrasWindow(show)
+					gui.c.GetAppState().HideCommandLog = !show
+					gui.c.SaveAppStateAndLogError()
+					return nil
+				},
+			},
+			{
+				Label:   gui.c.Tr.FocusCommandLog,
+				Keys:    []gocui.Key{gocui.NewKeyRune('f')},
+				OnPress: gui.handleFocusCommandLog,
 			},
 		},
-		{
-			displayString: gui.Tr.FocusCommandLog,
-			onPress:       gui.handleFocusCommandLog,
-		},
-	}
-
-	return gui.createMenu(gui.Tr.CommandLog, menuItems, createMenuOptions{showCancel: true})
+	})
 }
 
 func (gui *Gui) handleFocusCommandLog() error {
-	gui.ShowExtrasWindow = true
-	gui.State.Contexts.CommandLog.SetParentContext(gui.currentSideContext())
-	return gui.pushContext(gui.State.Contexts.CommandLog)
+	gui.c.State().SetShowExtrasWindow(true)
+	// TODO: is this necessary? Can't I just call 'return from context'?
+	gui.State.Contexts.CommandLog.SetParentContext(gui.c.Context().CurrentSide())
+	gui.c.Context().Push(gui.State.Contexts.CommandLog, types.OnFocusOpts{})
+	return nil
 }
 
 func (gui *Gui) scrollUpExtra() error {
 	gui.Views.Extras.Autoscroll = false
 
-	return gui.scrollUpView(gui.Views.Extras)
+	gui.scrollUpView(gui.Views.Extras)
+
+	return nil
 }
 
 func (gui *Gui) scrollDownExtra() error {
 	gui.Views.Extras.Autoscroll = false
 
-	if err := gui.scrollDownView(gui.Views.Extras); err != nil {
-		return err
-	}
+	gui.scrollDownView(gui.Views.Extras)
+
+	return nil
+}
+
+func (gui *Gui) pageUpExtrasPanel() error {
+	gui.Views.Extras.Autoscroll = false
+
+	gui.Views.Extras.ScrollUp(gui.Contexts().CommandLog.GetViewTrait().PageDelta())
+
+	return nil
+}
+
+func (gui *Gui) pageDownExtrasPanel() error {
+	gui.Views.Extras.Autoscroll = false
+
+	gui.Views.Extras.ScrollDown(gui.Contexts().CommandLog.GetViewTrait().PageDelta())
+
+	return nil
+}
+
+func (gui *Gui) goToExtrasPanelTop() error {
+	gui.Views.Extras.Autoscroll = false
+
+	gui.Views.Extras.ScrollUp(gui.Views.Extras.ViewLinesHeight())
+
+	return nil
+}
+
+func (gui *Gui) goToExtrasPanelBottom() error {
+	gui.Views.Extras.Autoscroll = true
+
+	gui.Views.Extras.ScrollDown(gui.Views.Extras.ViewLinesHeight())
 
 	return nil
 }
 
 func (gui *Gui) getCmdWriter() io.Writer {
-	return &prefixWriter{writer: gui.Views.Extras, prefix: style.FgMagenta.Sprintf("\n\n%s\n", gui.Tr.GitOutput)}
+	return &prefixWriter{writer: gui.Views.Extras, prefix: style.FgMagenta.Sprintf("\n\n%s\n", gui.c.Tr.GitOutput)}
 }
 
 // Ensures that the first write is preceded by writing a prefix.
@@ -68,13 +106,13 @@ type prefixWriter struct {
 	writer        io.Writer
 }
 
-func (self *prefixWriter) Write(p []byte) (n int, err error) {
+func (self *prefixWriter) Write(p []byte) (int, error) {
 	if !self.prefixWritten {
 		self.prefixWritten = true
 		// assuming we can write this prefix in one go
-		_, err = self.writer.Write([]byte(self.prefix))
+		n, err := self.writer.Write([]byte(self.prefix))
 		if err != nil {
-			return
+			return n, err
 		}
 	}
 	return self.writer.Write(p)

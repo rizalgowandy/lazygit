@@ -1,50 +1,22 @@
 package oscommands
 
 import (
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestOSCommandRunWithOutput(t *testing.T) {
-	type scenario struct {
-		command string
-		test    func(string, error)
-	}
-
-	scenarios := []scenario{
-		{
-			"echo -n '123'",
-			func(output string, err error) {
-				assert.NoError(t, err)
-				assert.EqualValues(t, "123", output)
-			},
-		},
-		{
-			"rmdir unexisting-folder",
-			func(output string, err error) {
-				assert.Regexp(t, "rmdir.*unexisting-folder.*", err.Error())
-			},
-		},
-	}
-
-	for _, s := range scenarios {
-		c := NewDummyOSCommand()
-		s.test(c.Cmd.New(s.command).RunWithOutput())
-	}
-}
-
 func TestOSCommandRun(t *testing.T) {
 	type scenario struct {
-		command string
-		test    func(error)
+		args []string
+		test func(error)
 	}
 
 	scenarios := []scenario{
 		{
-			"rmdir unexisting-folder",
+			[]string{"rmdir", "unexisting-folder"},
 			func(err error) {
 				assert.Regexp(t, "rmdir.*unexisting-folder.*", err.Error())
 			},
@@ -53,7 +25,7 @@ func TestOSCommandRun(t *testing.T) {
 
 	for _, s := range scenarios {
 		c := NewDummyOSCommand()
-		s.test(c.Cmd.New(s.command).Run())
+		s.test(c.Cmd.New(s.args).Run())
 	}
 }
 
@@ -103,9 +75,24 @@ func TestOSCommandQuoteWindows(t *testing.T) {
 
 	actual := osCommand.Quote(`hello "test" 'test2'`)
 
-	expected := `\"hello "'"'"test"'"'" 'test2'\"`
+	expected := `"hello \"test\" 'test2'"`
 
 	assert.EqualValues(t, expected, actual)
+}
+
+// On Windows, NewShell must hand the command to cmd.exe verbatim.
+func TestNewShellWindowsPassesMetacharactersVerbatim(t *testing.T) {
+	osCommand := NewDummyOSCommand()
+	platform := &Platform{OS: "windows", Shell: "cmd", ShellArg: "/c"}
+	osCommand.Platform = platform
+	osCommand.Cmd.platform = platform
+
+	command := `echo a && echo b | sort > out.txt < in.txt %PATH%`
+
+	assert.Equal(t,
+		[]string{"cmd", "/s", "/c", command},
+		osCommand.Cmd.NewShell(command, "").Args(),
+	)
 }
 
 func TestOSCommandFileType(t *testing.T) {
@@ -119,7 +106,11 @@ func TestOSCommandFileType(t *testing.T) {
 		{
 			"testFile",
 			func() {
-				if _, err := os.Create("testFile"); err != nil {
+				f, err := os.Create("testFile")
+				if err != nil {
+					panic(err)
+				}
+				if err := f.Close(); err != nil {
 					panic(err)
 				}
 			},
@@ -130,7 +121,11 @@ func TestOSCommandFileType(t *testing.T) {
 		{
 			"file with spaces",
 			func() {
-				if _, err := os.Create("file with spaces"); err != nil {
+				f, err := os.Create("file with spaces")
+				if err != nil {
+					panic(err)
+				}
+				if err := f.Close(); err != nil {
 					panic(err)
 				}
 			},
@@ -141,7 +136,7 @@ func TestOSCommandFileType(t *testing.T) {
 		{
 			"testDirectory",
 			func() {
-				if err := os.Mkdir("testDirectory", 0644); err != nil {
+				if err := os.Mkdir("testDirectory", 0o644); err != nil {
 					panic(err)
 				}
 			},
@@ -150,7 +145,7 @@ func TestOSCommandFileType(t *testing.T) {
 			},
 		},
 		{
-			"nonExistant",
+			"nonExistent",
 			func() {},
 			func(output string) {
 				assert.EqualValues(t, "other", output)
@@ -161,37 +156,64 @@ func TestOSCommandFileType(t *testing.T) {
 	for _, s := range scenarios {
 		s.setup()
 		s.test(FileType(s.path))
-		_ = os.RemoveAll(s.path)
+		assert.NoError(t, os.RemoveAll(s.path))
 	}
 }
 
-func TestOSCommandCreateTempFile(t *testing.T) {
+func TestOSCommandAppendLineToFile(t *testing.T) {
 	type scenario struct {
-		testName string
-		filename string
-		content  string
-		test     func(string, error)
+		path  string
+		setup func(string)
+		test  func(string)
 	}
 
 	scenarios := []scenario{
 		{
-			"valid case",
-			"filename",
-			"content",
-			func(path string, err error) {
-				assert.NoError(t, err)
-
-				content, err := ioutil.ReadFile(path)
-				assert.NoError(t, err)
-
-				assert.Equal(t, "content", string(content))
+			filepath.Join(os.TempDir(), "testFile"),
+			func(path string) {
+				if err := os.WriteFile(path, []byte("hello"), 0o600); err != nil {
+					panic(err)
+				}
+			},
+			func(output string) {
+				assert.EqualValues(t, "hello\nworld\n", output)
+			},
+		},
+		{
+			filepath.Join(os.TempDir(), "emptyTestFile"),
+			func(path string) {
+				if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+					panic(err)
+				}
+			},
+			func(output string) {
+				assert.EqualValues(t, "world\n", output)
+			},
+		},
+		{
+			filepath.Join(os.TempDir(), "testFileWithNewline"),
+			func(path string) {
+				if err := os.WriteFile(path, []byte("hello\n"), 0o600); err != nil {
+					panic(err)
+				}
+			},
+			func(output string) {
+				assert.EqualValues(t, "hello\nworld\n", output)
 			},
 		},
 	}
 
 	for _, s := range scenarios {
-		t.Run(s.testName, func(t *testing.T) {
-			s.test(NewDummyOSCommand().CreateTempFile(s.filename, s.content))
-		})
+		s.setup(s.path)
+		osCommand := NewDummyOSCommand()
+		if err := osCommand.AppendLineToFile(s.path, "world"); err != nil {
+			panic(err)
+		}
+		f, err := os.ReadFile(s.path)
+		if err != nil {
+			panic(err)
+		}
+		s.test(string(f))
+		_ = os.RemoveAll(s.path)
 	}
 }

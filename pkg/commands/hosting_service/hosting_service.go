@@ -1,17 +1,20 @@
 package hosting_service
 
 import (
-	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 
 	"github.com/go-errors/errors"
 	"github.com/jesseduffield/lazygit/pkg/i18n"
 	"github.com/jesseduffield/lazygit/pkg/utils"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
+
+	"golang.org/x/exp/slices"
 )
 
-// This package is for handling logic specific to a git hosting service like github, gitlab, bitbucket, etc.
+// This package is for handling logic specific to a git hosting service like github, gitlab, bitbucket, gitea, etc.
 // Different git hosting services have different URL formats for when you want to open a PR or view a commit,
 // and this package's responsibility is to determine which service you're using based on the remote URL,
 // and then which URL you need for whatever use case you have.
@@ -42,21 +45,68 @@ func (self *HostingServiceMgr) GetPullRequestURL(from string, to string) (string
 	}
 
 	if to == "" {
-		return gitService.getPullRequestURLIntoDefaultBranch(from), nil
-	} else {
-		return gitService.getPullRequestURLIntoTargetBranch(from, to), nil
+		return gitService.getPullRequestURLIntoDefaultBranch(url.QueryEscape(from)), nil
 	}
+	return gitService.getPullRequestURLIntoTargetBranch(url.QueryEscape(from), url.QueryEscape(to)), nil
 }
 
-func (self *HostingServiceMgr) GetCommitURL(commitSha string) (string, error) {
+func (self *HostingServiceMgr) GetCommitURL(commitHash string) (string, error) {
 	gitService, err := self.getService()
 	if err != nil {
 		return "", err
 	}
 
-	pullRequestURL := gitService.getCommitURL(commitSha)
+	pullRequestURL := gitService.getCommitURL(commitHash)
 
 	return pullRequestURL, nil
+}
+
+// e.g. 'jesseduffield/lazygit'
+func (self *HostingServiceMgr) GetRepoName() (string, error) {
+	gitService, err := self.getService()
+	if err != nil {
+		return "", err
+	}
+
+	repoName := gitService.repoName
+
+	return repoName, nil
+}
+
+// ServiceInfo holds the resolved hosting service for a remote URL. Owner
+// comes from the "owner" named regex capture, which only exists for
+// owner/repo-shaped providers (github, gitlab, bitbucket, gitea, codeberg);
+// it's empty for azuredevops and bitbucketServer, whose URLs are organised
+// differently. Repository is populated for every provider, but RepoName may
+// have more than two segments (e.g. "org/project/repo" for azuredevops).
+type ServiceInfo struct {
+	Provider   string // e.g. "github"
+	WebDomain  string // e.g. "github.com", or "git.acme.com" for an on-prem instance
+	Owner      string // e.g. "jesseduffield"
+	Repository string // e.g. "lazygit"
+	RepoName   string // e.g. "jesseduffield/lazygit"
+}
+
+// GetServiceInfo identifies which hosting service the configured remote URL
+// belongs to and returns enough information to talk to its web/API host.
+func (self *HostingServiceMgr) GetServiceInfo() (ServiceInfo, error) {
+	serviceDomain, err := self.getServiceDomain(self.remoteURL)
+	if err != nil {
+		return ServiceInfo{}, err
+	}
+
+	matches, err := serviceDomain.serviceDefinition.parseRemoteUrl(self.remoteURL)
+	if err != nil {
+		return ServiceInfo{}, err
+	}
+
+	return ServiceInfo{
+		Provider:   serviceDomain.serviceDefinition.provider,
+		WebDomain:  serviceDomain.webDomain,
+		Owner:      matches["owner"],
+		Repository: matches["repo"],
+		RepoName:   utils.ResolvePlaceholderString(serviceDomain.serviceDefinition.repoNameTemplate, matches),
+	}, nil
 }
 
 func (self *HostingServiceMgr) getService() (*Service, error) {
@@ -65,13 +115,19 @@ func (self *HostingServiceMgr) getService() (*Service, error) {
 		return nil, err
 	}
 
-	root, err := serviceDomain.getRootFromRemoteURL(self.remoteURL)
+	repoURL, err := serviceDomain.serviceDefinition.getRepoURLFromRemoteURL(self.remoteURL, serviceDomain.webDomain)
+	if err != nil {
+		return nil, err
+	}
+
+	repoName, err := serviceDomain.serviceDefinition.getRepoNameFromRemoteURL(self.remoteURL)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Service{
-		root:              root,
+		repoURL:           repoURL,
+		repoName:          repoName,
 		ServiceDefinition: serviceDomain.serviceDefinition,
 	}, nil
 }
@@ -80,9 +136,7 @@ func (self *HostingServiceMgr) getServiceDomain(repoURL string) (*ServiceDomain,
 	candidateServiceDomains := self.getCandidateServiceDomains()
 
 	for _, serviceDomain := range candidateServiceDomains {
-		// I feel like it makes more sense to see if the repo url contains the service domain's git domain,
-		// but I don't want to break anything by changing that right now.
-		if strings.Contains(repoURL, serviceDomain.serviceDefinition.provider) {
+		if strings.Contains(repoURL, serviceDomain.gitDomain) {
 			return &serviceDomain, nil
 		}
 	}
@@ -96,36 +150,32 @@ func (self *HostingServiceMgr) getCandidateServiceDomains() []ServiceDomain {
 		serviceDefinitionByProvider[serviceDefinition.provider] = serviceDefinition
 	}
 
-	var serviceDomains = make([]ServiceDomain, len(defaultServiceDomains))
-	copy(serviceDomains, defaultServiceDomains)
+	serviceDomains := slices.Clone(defaultServiceDomains)
 
-	if len(self.configServiceDomains) > 0 {
-		for gitDomain, typeAndDomain := range self.configServiceDomains {
-			splitData := strings.Split(typeAndDomain, ":")
-			if len(splitData) != 2 {
-				self.log.Errorf("Unexpected format for git service: '%s'. Expected something like 'github.com:github.com'", typeAndDomain)
-				continue
-			}
+	for gitDomain, typeAndDomain := range self.configServiceDomains {
+		provider, webDomain, success := strings.Cut(typeAndDomain, ":")
 
-			provider := splitData[0]
-			webDomain := splitData[1]
-
-			serviceDefinition, ok := serviceDefinitionByProvider[provider]
-			if !ok {
-				providerNames := []string{}
-				for _, serviceDefinition := range serviceDefinitions {
-					providerNames = append(providerNames, serviceDefinition.provider)
-				}
-				self.log.Errorf("Unknown git service type: '%s'. Expected one of %s", provider, strings.Join(providerNames, ", "))
-				continue
-			}
-
-			serviceDomains = append(serviceDomains, ServiceDomain{
-				gitDomain:         gitDomain,
-				webDomain:         webDomain,
-				serviceDefinition: serviceDefinition,
-			})
+		// we allow for one ':' for specifying the TCP port
+		if !success || strings.Count(webDomain, ":") > 1 {
+			self.log.Errorf("Unexpected format for git service: '%s'. Expected something like 'github.com:github.com'", typeAndDomain)
+			continue
 		}
+
+		serviceDefinition, ok := serviceDefinitionByProvider[provider]
+		if !ok {
+			providerNames := lo.Map(serviceDefinitions, func(serviceDefinition ServiceDefinition, _ int) string {
+				return serviceDefinition.provider
+			})
+
+			self.log.Errorf("Unknown git service type: '%s'. Expected one of %s", provider, strings.Join(providerNames, ", "))
+			continue
+		}
+
+		serviceDomains = append(serviceDomains, ServiceDomain{
+			gitDomain:         gitDomain,
+			webDomain:         webDomain,
+			serviceDefinition: serviceDefinition,
+		})
 	}
 
 	return serviceDomains
@@ -140,47 +190,74 @@ type ServiceDomain struct {
 	serviceDefinition ServiceDefinition
 }
 
-func (self ServiceDomain) getRootFromRemoteURL(repoURL string) (string, error) {
-	// we may want to make this more specific to the service in future e.g. if
-	// some new service comes along which has a different root url structure.
-	repoInfo, err := self.serviceDefinition.getRepoInfoFromURL(repoURL)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("https://%s/%s/%s", self.webDomain, repoInfo.Owner, repoInfo.Repository), nil
-}
-
-// RepoInformation holds some basic information about the repo
-type RepoInformation struct {
-	Owner      string
-	Repository string
-}
-
 type ServiceDefinition struct {
 	provider                        string
 	pullRequestURLIntoDefaultBranch string
 	pullRequestURLIntoTargetBranch  string
 	commitURL                       string
-	regexStrings                    []string
+	urlRegexps                      []*regexp.Regexp
+
+	// can expect 'webdomain' to be passed in. Otherwise, you get to pick what we match in the regex
+	repoURLTemplate  string
+	repoNameTemplate string
 }
 
-func (self ServiceDefinition) getRepoInfoFromURL(url string) (*RepoInformation, error) {
-	for _, regexStr := range self.regexStrings {
-		re := regexp.MustCompile(regexStr)
+func (self ServiceDefinition) getRepoURLFromRemoteURL(url string, webDomain string) (string, error) {
+	matches, err := self.parseRemoteUrl(url)
+	if err != nil {
+		return "", err
+	}
+
+	matches["webDomain"] = webDomain
+	return utils.ResolvePlaceholderString(self.repoURLTemplate, matches), nil
+}
+
+func (self ServiceDefinition) getRepoNameFromRemoteURL(url string) (string, error) {
+	matches, err := self.parseRemoteUrl(url)
+	if err != nil {
+		return "", err
+	}
+
+	return utils.ResolvePlaceholderString(self.repoNameTemplate, matches), nil
+}
+
+func (self ServiceDefinition) parseRemoteUrl(url string) (map[string]string, error) {
+	for _, re := range self.urlRegexps {
 		matches := utils.FindNamedMatches(re, url)
 		if matches != nil {
-			return &RepoInformation{
-				Owner:      matches["owner"],
-				Repository: matches["repo"],
-			}, nil
+			return matches, nil
 		}
 	}
 
 	return nil, errors.New("Failed to parse repo information from url")
 }
 
+// RepoInformation holds the owner and repository name parsed from a remote URL.
+type RepoInformation struct {
+	Owner      string
+	Repository string
+}
+
+// GetRepoInfoFromURL parses a remote URL (SSH or HTTPS) and extracts the
+// owner and repository name using the default URL regex patterns.
+func GetRepoInfoFromURL(url string) (RepoInformation, error) {
+	for _, re := range defaultUrlRegexps {
+		matches := utils.FindNamedMatches(re, url)
+		if matches != nil {
+			return RepoInformation{
+				Owner:      matches["owner"],
+				Repository: matches["repo"],
+			}, nil
+		}
+	}
+
+	return RepoInformation{}, errors.New("Failed to parse repo information from url")
+}
+
 type Service struct {
-	root string
+	repoURL string
+	// e.g. 'jesseduffield/lazygit'
+	repoName string
 	ServiceDefinition
 }
 
@@ -192,10 +269,10 @@ func (self *Service) getPullRequestURLIntoTargetBranch(from string, to string) s
 	return self.resolveUrl(self.pullRequestURLIntoTargetBranch, map[string]string{"From": from, "To": to})
 }
 
-func (self *Service) getCommitURL(commitSha string) string {
-	return self.resolveUrl(self.commitURL, map[string]string{"CommitSha": commitSha})
+func (self *Service) getCommitURL(commitHash string) string {
+	return self.resolveUrl(self.commitURL, map[string]string{"CommitHash": commitHash})
 }
 
 func (self *Service) resolveUrl(templateString string, args map[string]string) string {
-	return self.root + utils.ResolvePlaceholderString(templateString, args)
+	return self.repoURL + utils.ResolvePlaceholderString(templateString, args)
 }

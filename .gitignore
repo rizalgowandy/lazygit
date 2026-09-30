@@ -3,12 +3,6 @@
 # Logs
 *.log
 
-# Hidden
-.*
-
-# TODO
-TODO.*
-
 # Notes
 *.notes
 
@@ -16,21 +10,27 @@ TODO.*
 test/repos/repo
 coverage.txt
 
+# JetBrains stuff
+.idea/
+
 # Binaries
 lazygit
-
-# Exceptions
-!.gitignore
-!.goreleaser.yml
-!.circleci/
-!.github/
+lazygit.exe
 
 test/git_server/data
-test/integration/*/actual/
-test/integration/*/actual_remote/
-test/integration/*/used_config/
-# these sample hooks waste too much space
-test/integration/*/expected/.git_keep/hooks/
-test/integration/*/expected_remote/hooks/
-!.git_keep/
-lazygit.exe
+
+test/_results/**
+
+oryxBuildBinary
+__debug_bin*
+
+.worktrees
+demo/output/*
+
+coverage.out
+
+# Nix
+result
+result-*
+.direnv
+.envrc
